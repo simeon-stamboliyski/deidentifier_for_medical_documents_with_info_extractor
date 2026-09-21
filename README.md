@@ -1,2 +1,0 @@
-General Document De-Identifier (deidentifier_for_documents)
-A robust, high-performance C++ tool built for scanning, batch-processing, and de-identifying confidential files. While it functions as a general document de-identifier for text and standard PII, it includes specialized routines for parsing, splitting, and redacting sensitive data within medical documents (such as clinical epicrises).

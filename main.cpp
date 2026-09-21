@@ -1,26 +1,18 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <cstdlib>
 
-#include "deidentifier.hpp"
-#include "file_processor.hpp"
+#include "deidentifier/deidentifier.hpp"
+#include "file_processor/file_processor.hpp"
+#include "extractor/extractor.hpp"
 
 namespace fs = std::filesystem;
 
-namespace {
-
-void printSummary(const deid::ProcessingSummary& summary, const fs::path& outputFolder) {
-    std::cout << "\nFinished.\n"
-              << "  Processed: " << summary.processed << "\n"
-              << "  Skipped:   " << summary.skipped << "\n"
-              << "  Failed:    " << summary.failed << "\n"
-              << "  Redactions: " << summary.redactions << "\n"
-              << "  Output:    " << outputFolder.string() << "\n";
-}
-
-} // namespace
-
 int main(int argc, char* argv[]) {
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(NULL);
+
     const fs::path inputFolder = deid::getInputFolder(argc, argv);
 
     if (!fs::is_directory(inputFolder)) {
@@ -34,24 +26,31 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    const fs::path outputFolder = deid::createOutputFolder(inputFolder);
+    std::string homeDir = std::getenv("HOME") ? std::getenv("HOME") : ".";
+    fs::path desktopPath = fs::path(homeDir) / "Desktop";
+    const fs::path deidentifiedOutputFolder = desktopPath / "files_for_deidentifying_deidentified";
+
     std::cout << "Found " << files.size() << " supported file(s).\n";
-    std::cout << "Writing to: " << outputFolder.string() << "\n\n";
+    std::cout << "Writing deidentified files to: " << deidentifiedOutputFolder.string() << "\n\n";
+
+    fs::create_directories(deidentifiedOutputFolder);
 
     deid::Deidentifier deidentifier;
-    deid::ProcessingSummary summary;
+    deid::ProcessingSummary summary = {};
 
     for (std::size_t index = 0; index < files.size(); ++index) {
         const auto& file = files[index];
-        std::cout << "[" << (index + 1) << "/" << files.size() << "] "
-                  << file.string() << "\n";
+        std::cout << "[" << (index + 1) << "/" << files.size() << "] " << file.string() << "\n";
 
-        const auto result = deid::processFile(file, inputFolder, outputFolder, deidentifier);
+        const auto result = deid::processFile(file, inputFolder, deidentifiedOutputFolder, deidentifier);
         deid::addToSummary(summary, result);
 
         std::cout << "  " << result.message << "\n";
     }
 
-    printSummary(summary, outputFolder);
+    std::cout << "\nDeidentification completed. Starting information extraction...\n";
+
+    extractor::processDocuments(deidentifiedOutputFolder);
+
     return summary.failed == 0 ? 0 : 2;
 }

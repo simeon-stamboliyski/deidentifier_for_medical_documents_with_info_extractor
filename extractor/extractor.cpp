@@ -11,6 +11,8 @@
 
 namespace fs = std::filesystem;
 
+namespace extractor {
+
 const std::vector<std::string> FIELDS = {
     "Окончателна диагноза",
     "Придружаващи заболявания",
@@ -205,7 +207,7 @@ std::string readFileContent(const fs::path& filePath, const std::string& ext) {
     return content;
 }
 
-void processDocuments(const std::string& folderPath) {
+void processDocuments(const fs::path& folderPath) {
     int epicrisisCount = 0;
     int fileIndex = 1;
     
@@ -286,23 +288,6 @@ void processDocuments(const std::string& folderPath) {
     }
     
     if (csvFile.is_open()) csvFile.close();
-    std::cout << "Обработката приключи успешно! Общ брой обработени епикризи: " << epicrisisCount << "\n";
-    std::cout << "Всички CSV файлове са записани в папка: " << outputDir << "\n";
 }
 
-int main() {
-    std::ios_base::sync_with_stdio(false);
-    std::cin.tie(NULL);
-
-    std::string folderPath;
-    std::cout << "Въведете пътя до папката с документите: ";
-    std::getline(std::cin, folderPath);
-    
-    if (fs::exists(folderPath) && fs::is_directory(folderPath)) {
-        processDocuments(folderPath);
-    } else {
-        std::cerr << "Грешка: Невалиден път до папка!\n";
-    }
-    
-    return 0;
 }

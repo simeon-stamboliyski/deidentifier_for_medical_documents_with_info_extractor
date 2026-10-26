@@ -111,6 +111,7 @@ public:
                 tempOut.flush();
             }
 
+#ifdef DEID_DEBUG_DUMPS
             {
                 fs::path dbgTemp = outputPath.parent_path() / "debug_temp_for_pandoc.txt";
                 std::error_code ec;
@@ -121,6 +122,7 @@ public:
                             << ": " << ec.message() << "\n";
                 }
             }
+#endif
 
             if (!fs::exists(tempTxt) || fs::file_size(tempTxt) == 0) {
                 std::cerr << "writeText: tempTxt missing or empty: " << tempTxt << "\n";
@@ -300,28 +302,41 @@ FileResult processFile(
                 "Грешка: неуспешно четене или празен документ."};
     }
 
+#ifdef DEID_DEBUG_DUMPS
     {
         fs::path dbg1 = outputRoot / "debug_raw.txt";
         std::ofstream f(dbg1, std::ios::binary);
         f << rawContent;
     }
+#endif
 
     const std::string cleanedContent =
         MetadataProcessor::stripMetadata(rawContent, inputFile);
 
+#ifdef DEID_DEBUG_DUMPS
     {
         fs::path dbg2 = outputRoot / "debug_cleaned.txt";
         std::ofstream f(dbg2, std::ios::binary);
         f << cleanedContent;
     }
+#endif
 
-    const auto deidentified = deidentifier.deidentifyText(cleanedContent);
+    DeidentificationResult deidentified;
+    try {
+        deidentified = deidentifier.deidentifyText(cleanedContent);
+    } catch (const std::exception& ex) {
+        // Fail closed: do not write a partially anonymized document.
+        return {FileStatus::Failed, 0,
+                std::string("Грешка при анонимизацията: ") + ex.what()};
+    }
 
+#ifdef DEID_DEBUG_DUMPS
     {
         fs::path dbg3 = outputRoot / "debug_deid.txt";
         std::ofstream f(dbg3, std::ios::binary);
         f << deidentified.text;
     }
+#endif
 
     std::error_code error;
     const fs::path relativePath = fs::relative(inputFile, inputRoot, error);

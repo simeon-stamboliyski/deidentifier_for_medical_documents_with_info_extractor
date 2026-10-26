@@ -1,6 +1,7 @@
 #include "detectors.hpp"
 #include <algorithm>
 #include <cctype>
+#include <stdexcept>
 #include <unordered_set>
 
 namespace deid {
@@ -13,6 +14,32 @@ std::size_t getUtf8SequenceLength(unsigned char leadByte) {
     if ((leadByte & 0xF0) == 0xE0) return 3;
     if ((leadByte & 0xF8) == 0xF0) return 4;
     return 1;
+}
+
+bool isWordBefore(const std::string& text, std::size_t position) {
+    if (position == 0) return false;
+
+    const auto last = static_cast<unsigned char>(text[position - 1]);
+    if (last < 128) {
+        return std::isalnum(last) != 0 || last == '_';
+    }
+
+    std::size_t start = position - 1;
+    while (start > 0 &&
+           (static_cast<unsigned char>(text[start]) & 0xC0) == 0x80) {
+        --start;
+    }
+
+    const auto lead = static_cast<unsigned char>(text[start]);
+    return (lead == 0xD0 || lead == 0xD1 ||
+            lead == 0xD2 || lead == 0xD3);
+}
+
+bool isWordAfter(const std::string& text, std::size_t position) {
+    if (position >= text.size()) return false;
+    const auto lead = static_cast<unsigned char>(text[position]);
+    return (lead < 128 && (std::isalnum(lead) != 0 || lead == '_')) ||
+           (lead >= 0xD0 && lead <= 0xD3);
 }
 
 bool isValidEGN(const std::string& str) {
@@ -125,43 +152,16 @@ bool isStopWord(const std::string& word) {
     return stopWords.find(word) != stopWords.end();
 }
 
-std::vector<DetectedEntity> resolveOverlaps(std::vector<DetectedEntity>& entities) {
-    if (entities.empty()) return {};
-
-    std::sort(entities.begin(), entities.end(), [](const DetectedEntity& a, const DetectedEntity& b) {
-        if (a.start != b.start) return a.start < b.start;
-        return a.length > b.length;
-    });
-
-    std::vector<DetectedEntity> clean;
-    std::size_t currentEnd = 0;
-
-    for (const auto& entity : entities) {
-        if (entity.start >= currentEnd) {
-            clean.push_back(entity);
-            currentEnd = entity.start + entity.length;
-        } else {
-            auto& last = clean.back();
-            if (entity.start + entity.length > currentEnd && entity.score > last.score) {
-                last = entity;
-                currentEnd = entity.start + entity.length;
-            }
-        }
-    }
-
-    return clean;
-}
-
 } // namespace
 
 EntityDetector::EntityDetector() {
     regexes_ = {
         {EntityType::IDNumber, std::regex(
-            R"((?:И\.?\s*З\.?\s*(?:№|No\.?)?|НЗОК|РЗОК|УИН|ЛЗ|ЛКК|РЗИ|Амб\.?\s*(?:лист|№)|Рег\.?\s*№?)\s*[:№.-]?\s*[A-Za-zА-Яа-я0-9./\s-]{1,16})",
+            R"((?:И\.?З\.?|Из\.?|из\.?|НЗОК|РЗОК|УИН|ЛЗ|ЛКК|РЗИ|Амб\.?[ \t]*(?:лист|№)|Рег\.?[ \t]*(?:№)?)[ \t]*(?:(?:[:.-]|№)[ \t]*)?[A-Za-z]{0,3}[0-9][A-Za-z0-9./-]{0,15})",
             std::regex::icase
         )},
         {EntityType::Location, std::regex(
-            R"((?:гр\.|град|с\.|село|ул\.|улица|бул\.|булевард|ж\.?к\.?|кв\.|пл\.|площад)\s+[^\n,;\(\)\.]{2,40}(?:\s+(?:№|No|бл\.|вх\.|ап\.|ет\.)\s*\d+[А-Яа-яA-Za-z0-9\s-]*)?)",
+            R"((?:гр\.|град|с\.|село|ул\.|улица|бул\.|булевард|ж\.?к\.?|кв\.|пл\.|площад)[ \t]+(?:[^\x80-\xFF\n,;().]|[\xC2-\xDF][\x80-\xBF]|[\xE0-\xEF][\x80-\xBF]{2}|[\xF0-\xF4][\x80-\xBF]{3}){2,40}(?:[ \t]+(?:№|No|бл\.|вх\.|ап\.|ет\.)[ \t]*\d+(?:[A-Za-z0-9 \t-]|[\xD0-\xD3][\x80-\xBF])*)?)",
             std::regex::icase
         )},
         {EntityType::Phone, std::regex(
@@ -213,6 +213,24 @@ void EntityDetector::detectRegex(const std::string& text, std::vector<DetectedEn
         for (std::sregex_iterator it(text.begin(), text.end(), pattern), end; it != end; ++it) {
             std::size_t len = static_cast<std::size_t>(it->length());
             if (len <= 80) {
+                const auto pos = static_cast<std::size_t>(it->position());
+                auto atBoundary = [&](std::size_t offset) {
+                    return offset == text.size() ||
+                        (static_cast<unsigned char>(text[offset]) & 0xC0) != 0x80;
+                };
+                if ((type == EntityType::Location ||
+                     type == EntityType::IDNumber ||
+                     type == EntityType::Phone) &&
+                    isWordBefore(text, pos)) {
+                    continue;
+                }
+                if (!atBoundary(pos) || !atBoundary(pos + len)) {
+                    throw std::runtime_error(
+                        "Detector regex split a UTF-8 character; type=" +
+                        std::to_string(static_cast<int>(type)) +
+                        " byte_start=" + std::to_string(pos) +
+                        " byte_length=" + std::to_string(len));
+                }
                 results.push_back({
                     type,
                     static_cast<std::size_t>(it->position()),
@@ -223,6 +241,112 @@ void EntityDetector::detectRegex(const std::string& text, std::vector<DetectedEn
             }
         }
     }
+
+    static const std::regex sickLeaveNumber(
+        R"((?:болничен|Болничен)[ \t]+(?:лист|Лист)[ \t]*№[ \t]*:?[ \t]*((?:E|e|Е|е)[0-9]{8,14}))");
+    for (std::sregex_iterator it(text.begin(), text.end(), sickLeaveNumber), end;
+         it != end; ++it) {
+        const auto& match = *it;
+        const auto start = static_cast<std::size_t>(match.position(1));
+        const auto value = match[1].str();
+        const auto finish = start + value.size();
+        if (!isWordBefore(text, start) &&
+            !isWordAfter(text, finish)) {
+            results.push_back({EntityType::IDNumber, start,
+                               value.size(), value, 0.995});
+        }
+    }
+
+    std::size_t at = 0;
+    while ((at = text.find("год. От", at)) != std::string::npos) {
+        std::size_t cityStart = at + std::string("год. От").size();
+        while (cityStart < text.size() &&
+               (text[cityStart] == ' ' || text[cityStart] == '\t'))
+            ++cityStart;
+
+        std::size_t cursor = cityStart;
+        std::size_t cityEnd = cityStart;
+        for (int word = 0; word < 3; ++word) {
+            std::size_t length = 0;
+            if (!isCapitalizedWord(text, cursor, length)) break;
+            cityEnd = cursor + length;
+            cursor = cityEnd;
+            while (cursor < text.size() &&
+                   (text[cursor] == ' ' || text[cursor] == '\t'))
+                ++cursor;
+            if (cursor < text.size() && text[cursor] == ',') {
+                if (cityEnd - cityStart <= 90)
+                    results.push_back({EntityType::Location, cityStart,
+                                       cityEnd - cityStart,
+                                       text.substr(cityStart, cityEnd - cityStart),
+                                       0.97});
+                break;
+            }
+            if (cursor == cityEnd) break; 
+        }
+
+        std::size_t headerEnd = text.find('\n', cityStart);
+        if (headerEnd == std::string::npos || headerEnd > cityStart + 240)
+            headerEnd = std::min(text.size(), cityStart + 240);
+        const auto admission = text.find("по КП", cityStart);
+        if (admission != std::string::npos && admission < headerEnd)
+            headerEnd = admission;
+
+        std::size_t no = cityStart;
+        while ((no = text.find("No", no)) != std::string::npos && no < headerEnd) {
+            std::size_t endNo = no + 2;
+            if (isWordBefore(text, no) ||
+                (endNo < headerEnd && text[endNo] != ' ' && text[endNo] != '\t')) {
+                no += 2;
+                continue;
+            }
+            while (endNo < headerEnd && (text[endNo] == ' ' || text[endNo] == '\t'))
+                ++endNo;
+            const auto digits = endNo;
+            while (endNo < headerEnd &&
+                   endNo - digits < 4 && text[endNo] >= '0' && text[endNo] <= '9')
+                ++endNo;
+            if (endNo > digits) {
+                if (endNo < headerEnd &&
+                    static_cast<unsigned char>(text[endNo]) >= 0xD0 &&
+                    static_cast<unsigned char>(text[endNo]) <= 0xD3 &&
+                    endNo + 1 < headerEnd &&
+                    (static_cast<unsigned char>(text[endNo + 1]) & 0xC0) == 0x80)
+                    endNo += 2;
+                else if (endNo < headerEnd &&
+                         ((text[endNo] >= 'A' && text[endNo] <= 'Z') ||
+                          (text[endNo] >= 'a' && text[endNo] <= 'z')))
+                    ++endNo;
+                if (!isWordAfter(text, endNo)) {
+                    std::size_t streetEnd = no;
+                    while (streetEnd > cityStart &&
+                           (text[streetEnd - 1] == ' ' ||
+                            text[streetEnd - 1] == '\t'))
+                        --streetEnd;
+                    std::size_t streetStart = streetEnd;
+                    while (streetStart > cityStart &&
+                           text[streetStart - 1] != ' ' &&
+                           text[streetStart - 1] != '\t' &&
+                           text[streetStart - 1] != ',' &&
+                           text[streetStart - 1] != '.')
+                        --streetStart;
+                    std::size_t streetLen = 0;
+                    if (isCapitalizedWord(text, streetStart, streetLen) &&
+                        streetStart + streetLen == streetEnd) {
+                        results.push_back({EntityType::Location, streetStart,
+                                           streetLen,
+                                           text.substr(streetStart, streetLen),
+                                           0.96});
+                    }
+                    results.push_back({EntityType::Location, no, endNo - no,
+                                       text.substr(no, endNo - no), 0.97});
+                }
+            }
+            no += 2;
+        }
+        at = cityStart;
+    }
+
 }
 
 void EntityDetector::detectLNCh(const std::string& text, std::vector<DetectedEntity>& results) const {
@@ -262,13 +386,16 @@ void EntityDetector::detectDictionaries(const std::string& text, std::vector<Det
         for (const auto& term : terms) {
             std::size_t pos = text.find(term);
             while (pos != std::string::npos) {
-                results.push_back({
-                    type,
-                    pos,
-                    term.length(),
-                    term,
-                    0.85
-                });
+                if (!isWordBefore(text, pos) &&
+                    !isWordAfter(text, pos + term.length())) {
+                    results.push_back({
+                        type,
+                        pos,
+                        term.length(),
+                        term,
+                        0.85
+                    });
+                }
                 pos = text.find(term, pos + term.length());
             }
         }

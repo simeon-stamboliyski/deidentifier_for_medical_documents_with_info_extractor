@@ -34,6 +34,8 @@ public:
 
 private:
     void detectRegex(const std::string& text, std::vector<DetectedEntity>& results) const;
+    void detectLNCh(const std::string& text, std::vector<DetectedEntity>& results) const;
+    void detectUIN(const std::string& text, std::vector<DetectedEntity>& results) const;
     void detectDictionaries(const std::string& text, std::vector<DetectedEntity>& results) const;
     void detectNER(const std::string& text, std::vector<DetectedEntity>& results) const;
     void detectEGN(const std::string& text, std::vector<DetectedEntity>& results) const;

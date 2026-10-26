@@ -55,14 +55,6 @@ std::string trim(const std::string& str) {
     return str.substr(start, end - start + 1);
 }
 
-bool matchesBulgarianCharCaseInsensitive(unsigned char c1, unsigned char c2, 
-                                        unsigned char targetUpper1, unsigned char targetUpper2,
-                                        unsigned char targetLower1, unsigned char targetLower2) {
-    if (c1 == targetUpper1 && c2 == targetUpper2) return true;
-    if (c1 == targetLower1 && c2 == targetLower2) return true;
-    return false;
-}
-
 struct Utf8Char {
     std::string bytes;
     std::size_t byteOffset;
@@ -276,7 +268,8 @@ void processDocuments(const fs::path& folderPath, const fs::path& outputDir) {
             continue;
         }
 
-        if (entry.path().filename().string().rfind("epicrisies_export_", 0) == 0) {
+        const std::string filename = entry.path().filename().string();
+        if (filename.rfind("epicrisies_info_", 0) == 0 || filename.rfind("epicrisies_export_", 0) == 0) {
             continue;
         }
 

@@ -1,46 +1,43 @@
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <string>
-#include <cstdlib>
 
 #include "deidentifier/deidentifier.hpp"
-#include "file_processor/file_processor.hpp"
 #include "extractor/extractor.hpp"
+#include "file_processor/file_processor.hpp"
 
 namespace fs = std::filesystem;
 
 int main(int argc, char* argv[]) {
     std::ios_base::sync_with_stdio(false);
-    std::cin.tie(NULL);
+    std::cin.tie(nullptr);
 
     const fs::path inputFolder = deid::getInputFolder(argc, argv);
 
-    if (!fs::is_directory(inputFolder)) {
-        std::cerr << "Error: the path is not a valid folder.\n";
+    std::error_code ec;
+    if (!fs::is_directory(inputFolder, ec)) {
+        std::cerr << "Грешка: Въведеният път не е валидна директория.\n";
         return 1;
     }
 
     const auto files = deid::findSupportedFiles(inputFolder);
     if (files.empty()) {
-        std::cout << "No supported documents found to deidentify.\n";
+        std::cout << "Не бяха открити поддържани документи за обработка.\n";
         return 0;
     }
 
-    std::string homeDir = std::getenv("HOME") ? std::getenv("HOME") : ".";
-    fs::path desktopPath = fs::path(homeDir) / "Desktop";
-    const fs::path deidentifiedOutputFolder = desktopPath / "files_for_deidentifying_deidentified";
+    const fs::path deidentifiedOutputFolder = deid::createOutputFolder(inputFolder);
 
-    std::cout << "Found " << files.size() << " supported file(s).\n";
-    std::cout << "Writing deidentified files to: " << deidentifiedOutputFolder.string() << "\n\n";
-
-    fs::create_directories(deidentifiedOutputFolder);
+    std::cout << "Намерени са " << files.size() << " поддържан(и) документ(а).\n";
+    std::cout << "Изходна папка за анонимизирани файлове: " << deidentifiedOutputFolder.string() << "\n\n";
 
     deid::Deidentifier deidentifier;
     deid::ProcessingSummary summary = {};
 
     for (std::size_t index = 0; index < files.size(); ++index) {
         const auto& file = files[index];
-        std::cout << "[" << (index + 1) << "/" << files.size() << "] " << file.string() << "\n";
+        std::cout << "[" << (index + 1) << "/" << files.size() << "] " << file.filename().string() << "\n";
 
         const auto result = deid::processFile(file, inputFolder, deidentifiedOutputFolder, deidentifier);
         deid::addToSummary(summary, result);
@@ -48,9 +45,19 @@ int main(int argc, char* argv[]) {
         std::cout << "  " << result.message << "\n";
     }
 
-    std::cout << "\nDeidentification completed. Starting information extraction...\n";
+    std::cout << "\n--- Резюме на анонимизацията ---\n";
+    std::cout << "Успешно обработени: " << summary.processed << "\n";
+    std::cout << "Пропуснати:        " << summary.skipped << "\n";
+    std::cout << "Неуспешни:         " << summary.failed << "\n";
+    std::cout << "Общ брой редакции: " << summary.redactions << "\n";
+    std::cout << "--------------------------------\n\n";
 
-    extractor::processDocuments(deidentifiedOutputFolder);
+    if (summary.processed > 0) {
+        std::cout << "Стартиране на извличането на информация от епикризите...\n";
+        const fs::path extractionOutputDir = deidentifiedOutputFolder / "extracted_data";
+        extractor::processDocuments(deidentifiedOutputFolder, extractionOutputDir);
+        std::cout << "Извличането приключи. Резултатите са записани в: " << extractionOutputDir.string() << "\n";
+    }
 
-    return summary.failed == 0 ? 0 : 2;
+    return (summary.failed == 0) ? 0 : 2;
 }

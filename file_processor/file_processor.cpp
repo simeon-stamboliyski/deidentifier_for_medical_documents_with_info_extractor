@@ -7,7 +7,6 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
-#include <random>
 #include <set>
 #include <sstream>
 
@@ -69,13 +68,16 @@ public:
     explicit BinaryDocumentParser(std::string ext) : ext_(std::move(ext)) {}
 
     std::string extractText(const fs::path& filePath) override {
-        std::string command;
         const fs::path tempOutput = generateUniqueTempPath("deid_extract", ".txt");
+        std::string command;
 
         if (ext_ == ".pdf") {
-            command = "pdftotext " + escapeShellArg(filePath.string()) + " " + escapeShellArg(tempOutput.string()) + " 2>/dev/null";
+            command = "pdftotext " + escapeShellArg(filePath.string()) + " "
+                    + escapeShellArg(tempOutput.string()) + " 2>/dev/null";
         } else if (ext_ == ".docx" || ext_ == ".doc") {
-            command = "pandoc " + escapeShellArg(filePath.string()) + " -t plain -o " + escapeShellArg(tempOutput.string()) + " 2>/dev/null";
+            command = "textutil -convert txt -encoding utf-8 -output "
+                    + escapeShellArg(tempOutput.string()) + " "
+                    + escapeShellArg(filePath.string()) + " 2>/dev/null";
         }
 
         std::string extracted;
@@ -95,28 +97,115 @@ public:
     }
 
     bool writeText(const fs::path& outputPath, const std::string& content) override {
-        const fs::path tempTxt = generateUniqueTempPath("deid_render", ".txt");
-        {
-            std::ofstream tempOut(tempTxt, std::ios::binary);
-            if (!tempOut) return false;
-            tempOut << content;
-        }
-
         bool success = false;
-        std::string command = "pandoc " + escapeShellArg(tempTxt.string()) + " -o " + escapeShellArg(outputPath.string()) + " 2>/dev/null";
 
-        if (std::system(command.c_str()) == 0 && fs::exists(outputPath)) {
-            success = true;
-        } else {
-            std::ofstream output(outputPath, std::ios::binary);
-            if (output) {
+        if (ext_ == ".docx" || ext_ == ".doc") {
+            const fs::path tempTxt = generateUniqueTempPath("deid_render", ".txt");
+            {
+                std::ofstream tempOut(tempTxt, std::ios::binary);
+                if (!tempOut) {
+                    std::cerr << "writeText: failed to open tempTxt for writing: " << tempTxt << "\n";
+                    return false;
+                }
+                tempOut << content;
+                tempOut.flush();
+            }
+
+            {
+                fs::path dbgTemp = outputPath.parent_path() / "debug_temp_for_pandoc.txt";
+                std::error_code ec;
+                fs::copy_file(tempTxt, dbgTemp,
+                            fs::copy_options::overwrite_existing, ec);
+                if (ec) {
+                    std::cerr << "writeText: failed to copy tempTxt to " << dbgTemp
+                            << ": " << ec.message() << "\n";
+                }
+            }
+
+            if (!fs::exists(tempTxt) || fs::file_size(tempTxt) == 0) {
+                std::cerr << "writeText: tempTxt missing or empty: " << tempTxt << "\n";
+                std::error_code ec;
+                fs::remove(tempTxt, ec);
+                return false;
+            }
+
+            fs::path pandocOut = outputPath;
+            if (ext_ == ".doc") {
+                pandocOut.replace_extension(".docx");
+            }
+
+            std::string pandocCmd =
+                "pandoc " + escapeShellArg(tempTxt.string()) +
+                " -f markdown_strict-smart -t docx -o " +
+                escapeShellArg(pandocOut.string()) +
+                " 2>/dev/null";
+
+            std::cerr << "writeText: running pandoc cmd: " << pandocCmd << "\n";
+
+            int rc = std::system(pandocCmd.c_str());
+            if (rc != 0) {
+                std::cerr << "writeText: pandoc exited with code " << rc << "\n";
+            }
+
+            if (fs::exists(pandocOut)) {
+                auto sz = fs::file_size(pandocOut);
+                std::cerr << "writeText: pandocOut exists, size = " << sz << "\n";
+                if (rc == 0 && sz > 0) {
+                    success = true;
+
+                    if (ext_ == ".doc" && pandocOut != outputPath) {
+                        std::error_code ec;
+                        fs::rename(pandocOut, outputPath, ec);
+                        if (ec) {
+                            std::cerr << "writeText: failed to rename " << pandocOut
+                                    << " to " << outputPath << ": " << ec.message() << "\n";
+                            success = false;
+                        }
+                    }
+                } else if (sz == 0) {
+                    std::cerr << "writeText: pandocOut is zero-length file: " << pandocOut << "\n";
+                }
+            } else {
+                std::cerr << "writeText: pandocOut was not created: " << pandocOut << "\n";
+            }
+
+            std::error_code ec;
+            fs::remove(tempTxt, ec);
+            if (ec) {
+                std::cerr << "writeText: failed to remove tempTxt: " << tempTxt
+                        << ", ec = " << ec.message() << "\n";
+            }
+        } else if (ext_ == ".pdf") {
+            fs::path txtOutput = outputPath;
+            txtOutput.replace_extension(".txt");
+
+            std::ofstream output(txtOutput, std::ios::binary);
+            if (!output) {
+                std::cerr << "writeText: failed to open txtOutput for PDF: " << txtOutput << "\n";
+            } else {
                 output << content;
                 success = output.good();
+                if (!success) {
+                    std::cerr << "writeText: writing to txtOutput failed: " << txtOutput << "\n";
+                }
+            }
+        } else {
+            std::ofstream output(outputPath, std::ios::binary);
+            if (!output) {
+                std::cerr << "writeText: failed to open outputPath: " << outputPath << "\n";
+            } else {
+                output << content;
+                success = output.good();
+                if (!success) {
+                    std::cerr << "writeText: writing to outputPath failed: " << outputPath << "\n";
+                }
             }
         }
 
-        std::error_code ec;
-        fs::remove(tempTxt, ec);
+        if (!success) {
+            std::cerr << "writeText: overall failed for " << outputPath << " (ext_=" << ext_ << ")\n";
+        }
+
         return success;
     }
 
@@ -199,40 +288,65 @@ FileResult processFile(
 ) {
     const std::string ext = normalizedExtension(inputFile);
     auto parser = createParserForExtension(ext);
-    
+
     if (!parser) {
-        return {FileStatus::Skipped, 0, "Пропуснат: неподдържан формат на файла (" + ext + ")"};
+        return {FileStatus::Skipped, 0,
+                "Пропуснат: неподдържан формат на файла (" + ext + ")"};
     }
 
     std::string rawContent = parser->extractText(inputFile);
     if (rawContent.empty()) {
-        return {FileStatus::Failed, 0, "Грешка: неуспешно четене или празен документ."};
+        return {FileStatus::Failed, 0,
+                "Грешка: неуспешно четене или празен документ."};
     }
 
-    const std::string cleanedContent = MetadataProcessor::stripMetadata(rawContent, inputFile);
+    {
+        fs::path dbg1 = outputRoot / "debug_raw.txt";
+        std::ofstream f(dbg1, std::ios::binary);
+        f << rawContent;
+    }
+
+    const std::string cleanedContent =
+        MetadataProcessor::stripMetadata(rawContent, inputFile);
+
+    {
+        fs::path dbg2 = outputRoot / "debug_cleaned.txt";
+        std::ofstream f(dbg2, std::ios::binary);
+        f << cleanedContent;
+    }
 
     const auto deidentified = deidentifier.deidentifyText(cleanedContent);
+
+    {
+        fs::path dbg3 = outputRoot / "debug_deid.txt";
+        std::ofstream f(dbg3, std::ios::binary);
+        f << deidentified.text;
+    }
 
     std::error_code error;
     const fs::path relativePath = fs::relative(inputFile, inputRoot, error);
     if (error) {
-        return {FileStatus::Failed, 0, "Грешка: неуспешно изчисляване на изходния път."};
+        return {FileStatus::Failed, 0,
+                "Грешка: неуспешно изчисляване на изходния път."};
     }
 
-    const fs::path outputFile = outputRoot / relativePath;
+    fs::path outputFile = outputRoot / relativePath;
     fs::create_directories(outputFile.parent_path(), error);
     if (error) {
-        return {FileStatus::Failed, 0, "Грешка: директорията не може да бъде създадена."};
+        return {FileStatus::Failed, 0,
+                "Грешка: директорията не може да бъде създадена."};
     }
 
     if (!parser->writeText(outputFile, deidentified.text)) {
-        return {FileStatus::Failed, 0, "Грешка: записът на анонимизирания файл беше неуспешен."};
+        return {FileStatus::Failed, 0,
+                "Грешка: записът на анонимизирания файл беше неуспешен."};
     }
 
     return {
-        FileStatus::Processed, 
+        FileStatus::Processed,
         deidentified.redactions,
-        "Обработен (" + ext + "): " + std::to_string(deidentified.redactions) + " редакции."
+        "Обработен (" + ext + "): " +
+            std::to_string(deidentified.redactions) + " редакции."
     };
 }
 

@@ -24,6 +24,7 @@ public:
 
 private:
     std::string getPseudonym(const std::string& entityText, EntityType type);
+    std::vector<DetectedEntity> resolveOverlaps(std::vector<DetectedEntity> entities) const;
 
     EntityDetector detector_;
     std::unordered_map<std::string, std::string> pseudonyms_;

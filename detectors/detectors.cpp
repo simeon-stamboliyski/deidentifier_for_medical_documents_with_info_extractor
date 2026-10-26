@@ -205,7 +205,7 @@ std::vector<DetectedEntity> EntityDetector::detectAll(const std::string& text) c
     detectLNCh(text, rawResults);
     detectUIN(text, rawResults);
 
-    return resolveOverlaps(rawResults);
+    return rawResults;
 }
 
 void EntityDetector::detectRegex(const std::string& text, std::vector<DetectedEntity>& results) const {

@@ -180,34 +180,57 @@ std::map<std::string, std::string> parseEpicrisis(const std::string& text) {
     return data;
 }
 
+namespace {
+
+std::string escapeShellArg(const std::string& arg) {
+    std::string escaped = "\"";
+    for (char c : arg) {
+        if (c == '"' || c == '\\' || c == '$' || c == '`') {
+            escaped += '\\';
+        }
+        escaped += c;
+    }
+    escaped += "\"";
+    return escaped;
+}
+
 std::string readFileContent(const fs::path& filePath, const std::string& ext) {
-    std::string content;
-
     if (ext == ".docx" || ext == ".doc") {
-        std::string command = "textutil -convert txt -stdout \"" + filePath.string() + "\" 2>/dev/null";
-        FILE* pipe = popen(command.c_str(), "r");
-        if (!pipe) {
-            command = "pandoc -f docx -t plain \"" + filePath.string() + "\" 2>/dev/null";
-            pipe = popen(command.c_str(), "r");
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        fs::path tempTxt =
+            fs::temp_directory_path() /
+            fs::path("ext_temp_" + filePath.stem().string() + "_" +
+                     std::to_string(now) + ".txt");
+
+        std::string command =
+            "textutil -convert txt -encoding utf-8 -output " +
+            escapeShellArg(tempTxt.string()) + " " +
+            escapeShellArg(filePath.string()) + " 2>/dev/null";
+
+        std::string content;
+        if (std::system(command.c_str()) == 0 && fs::exists(tempTxt)) {
+            std::ifstream file(tempTxt, std::ios::binary);
+            if (file.is_open()) {
+                std::stringstream bufferStream;
+                bufferStream << file.rdbuf();
+                content = bufferStream.str();
+            }
         }
 
-        if (pipe) {
-            char buffer[512];
-            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                content += buffer;
-            }
-            pclose(pipe);
-        }
-    } else {
-        std::ifstream file(filePath, std::ios::binary);
-        if (!file.is_open()) return "";
-        std::stringstream bufferStream;
-        bufferStream << file.rdbuf();
-        content = bufferStream.str();
+        std::error_code ec;
+        fs::remove(tempTxt, ec);
+        return content; 
     }
 
-    return content;
+    std::ifstream file(filePath, std::ios::binary);
+    if (!file.is_open()) return "";
+    std::stringstream bufferStream;
+    bufferStream << file.rdbuf();
+    return bufferStream.str();
 }
+
+} // namespace
+
 
 std::string escapeCsvField(const std::string& field) {
     std::string escaped = "\"";

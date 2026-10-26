@@ -1,28 +1,11 @@
 #include "deidentifier.hpp"
 #include <algorithm>
 #include <cctype>
+#include <fstream>
 
 namespace deid {
 
 namespace {
-
-std::string trimPunctuationAndSpace(const std::string& str) {
-    std::size_t start = 0;
-    while (start < str.size() && (std::isspace(static_cast<unsigned char>(str[start])) || 
-                                 std::ispunct(static_cast<unsigned char>(str[start])))) {
-        ++start;
-    }
-
-    if (start >= str.size()) return "";
-
-    std::size_t end = str.size() - 1;
-    while (end > start && (std::isspace(static_cast<unsigned char>(str[end])) || 
-                           std::ispunct(static_cast<unsigned char>(str[end])))) {
-        --end;
-    }
-
-    return str.substr(start, end - start + 1);
-}
 
 std::string toLowerUtf8(const std::string& str) {
     std::string result;
@@ -31,29 +14,23 @@ std::string toLowerUtf8(const std::string& str) {
     for (std::size_t i = 0; i < str.size(); ++i) {
         unsigned char c1 = static_cast<unsigned char>(str[i]);
 
+        // UTF-8 Cyrillic lowercase conversion
         if (c1 == 0xD0 && (i + 1) < str.size()) {
             unsigned char c2 = static_cast<unsigned char>(str[i + 1]);
-
-            if (c2 >= 0x90 && c2 <= 0x9F) {
+            if (c2 >= 0x90 && c2 <= 0x9F) { // А-П -> а-п
                 result += static_cast<char>(0xD0);
                 result += static_cast<char>(c2 + 0x20);
                 ++i;
                 continue;
-            }
-            if (c2 >= 0xA0 && c2 <= 0xAF) {
+            } else if (c2 >= 0xA0 && c2 <= 0xAF) { // Р-Я -> р-я
                 result += static_cast<char>(0xD1);
                 result += static_cast<char>(c2 - 0x20);
                 ++i;
                 continue;
             }
-            if (c2 == 0x8D) {
-                result += static_cast<char>(0xD1);
-                result += static_cast<char>(0x9D);
-                ++i;
-                continue;
-            }
         }
 
+        // Standard ASCII lowercase conversion
         if (c1 < 128) {
             result += static_cast<char>(std::tolower(c1));
         } else {
@@ -80,49 +57,46 @@ std::string entityTypeToString(EntityType type) {
 
 } // namespace
 
-void Deidentifier::reset() {
-    pseudonyms_.clear();
-    typeCounters_.clear();
-}
-
 DeidentificationResult Deidentifier::deidentifyText(const std::string& text) {
-    const auto entities = detector_.detectAll(text);
-
     DeidentificationResult result;
-    result.text.reserve(text.size());
-
-    std::size_t previousEnd = 0;
-
-    for (const auto& entity : entities) {
-        if (entity.start < previousEnd) {
-            continue; 
-        }
-
-        result.text.append(text, previousEnd, entity.start - previousEnd);
-        result.text += getPseudonym(entity.text, entity.type);
-        previousEnd = entity.start + entity.length;
-        ++result.redactions;
-    }
-
-    result.text.append(text, previousEnd, std::string::npos);
+    result.text = text;
+    result.redactions = 0;
     return result;
 }
 
-std::string Deidentifier::getPseudonym(const std::string& entityText, EntityType type) {
-    const std::string cleaned = trimPunctuationAndSpace(entityText);
-    const std::string key = toLowerUtf8(cleaned.empty() ? entityText : cleaned);
 
+
+std::vector<DetectedEntity> Deidentifier::resolveOverlaps(std::vector<DetectedEntity> entities) const {
+    if (entities.empty()) return {};
+
+    std::sort(entities.begin(), entities.end(), [](const DetectedEntity& a, const DetectedEntity& b) {
+        if (a.start != b.start) return a.start < b.start;
+        if (a.score != b.score) return a.score > b.score;
+        return a.length > b.length;
+    });
+
+    std::vector<DetectedEntity> resolved;
+    std::size_t lastEnd = 0;
+
+    for (const auto& entity : entities) {
+        if (entity.start >= lastEnd) {
+            resolved.push_back(entity);
+            lastEnd = entity.start + entity.length;
+        }
+    }
+
+    return resolved;
+}
+
+std::string Deidentifier::getPseudonym(const std::string& entityText, EntityType type) {
+    const std::string key = toLowerUtf8(entityText);
     const auto existing = pseudonyms_.find(key);
     if (existing != pseudonyms_.end()) {
         return existing->second;
     }
 
-    const int typeKey = static_cast<int>(type);
-    const std::size_t count = ++typeCounters_[typeKey];
-
     const std::string prefix = entityTypeToString(type);
-    const std::string pseudonym = "[" + prefix + "_" + std::to_string(count) + "]";
-
+    const std::string pseudonym = "[" + prefix + "_" + std::to_string(pseudonyms_.size() + 1) + "]";
     pseudonyms_[key] = pseudonym;
     return pseudonym;
 }

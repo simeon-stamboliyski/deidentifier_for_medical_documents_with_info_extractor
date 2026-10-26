@@ -1,13 +1,16 @@
-#include <iostream>
+#include "extractor.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <iostream>
+#include <map>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <vector>
-#include <filesystem>
-#include <regex>
-#include <map>
-#include <cctype>
-#include <cstdio>
 
 namespace fs = std::filesystem;
 
@@ -43,74 +46,34 @@ const std::vector<std::string> FIELDS = {
     "Препоръки към общо практикуващ лекар (ОПЛ)"
 };
 
-std::string escapeCsvField(const std::string& field) {
-    std::string escaped = "\"";
-    for (char c : field) {
-        if (c == '"') {
-            escaped += "\"\""; 
-        } else if (c != '\r' && c != '\n') {
-            escaped += c;
-        } else {
-            escaped += " "; 
-        }
-    }
-    escaped += "\"";
-    return escaped;
+namespace {
+
+std::string trim(const std::string& str) {
+    const auto start = str.find_first_not_of(" \t\n\r");
+    if (start == std::string::npos) return "";
+    const auto end = str.find_last_not_of(" \t\n\r");
+    return str.substr(start, end - start + 1);
 }
 
-std::map<std::string, std::string> parseEpicrisis(const std::string& text) {
-    std::map<std::string, std::string> data;
-    
-    for (size_t i = 0; i < FIELDS.size(); ++i) {
-        std::string currentField = FIELDS[i];
-        
-        std::string pattern = currentField + R"(\s*:\s*)";
-        std::regex fieldRegex(pattern);
-        
-        std::smatch match;
-        if (!std::regex_search(text, match, fieldRegex)) {
-            data[currentField] = "";
-            continue;
-        }
-        
-        size_t startPos = match.position() + match.length();
-        size_t endPos = text.length();
-        
-        for (size_t j = 0; j < FIELDS.size(); ++j) {
-            if (i == j) continue;
-            std::string nextPattern = FIELDS[j] + R"(\s*:\s*)";
-            std::regex nextRegex(nextPattern);
-            std::smatch nextMatch;
-            
-            std::string searchSubstr = text.substr(startPos);
-            if (std::regex_search(searchSubstr, nextMatch, nextRegex)) {
-                size_t absoluteNextPos = startPos + nextMatch.position();
-                if (absoluteNextPos < endPos) {
-                    endPos = absoluteNextPos;
-                }
-            }
-        }
-        
-        std::string value = text.substr(startPos, endPos - startPos);
-
-        value.erase(0, value.find_first_not_of(" \t\n\r"));
-        value.erase(value.find_last_not_of(" \t\n\r") + 1);
-        data[currentField] = value;
-    }
-    return data;
+bool matchesBulgarianCharCaseInsensitive(unsigned char c1, unsigned char c2, 
+                                        unsigned char targetUpper1, unsigned char targetUpper2,
+                                        unsigned char targetLower1, unsigned char targetLower2) {
+    if (c1 == targetUpper1 && c2 == targetUpper2) return true;
+    if (c1 == targetLower1 && c2 == targetLower2) return true;
+    return false;
 }
 
 struct Utf8Char {
     std::string bytes;
-    size_t byteOffset;
+    std::size_t byteOffset;
 };
 
 std::vector<Utf8Char> decodeUtf8(const std::string& str) {
     std::vector<Utf8Char> chars;
-    size_t i = 0;
+    std::size_t i = 0;
     while (i < str.length()) {
-        unsigned char c = str[i];
-        size_t len = 1;
+        unsigned char c = static_cast<unsigned char>(str[i]);
+        std::size_t len = 1;
         if ((c & 0x80) == 0) len = 1;
         else if ((c & 0xE0) == 0xC0) len = 2;
         else if ((c & 0xF0) == 0xE0) len = 3;
@@ -118,49 +81,44 @@ std::vector<Utf8Char> decodeUtf8(const std::string& str) {
 
         if (i + len > str.length()) len = str.length() - i;
 
-        Utf8Char uc;
-        uc.bytes = str.substr(i, len);
-        uc.byteOffset = i;
-        chars.push_back(uc);
+        chars.push_back({str.substr(i, len), i});
         i += len;
     }
     return chars;
 }
 
 bool matchesEpicrisisLetter(const std::string& utf8Bytes, int letterIndex) {
-    if (utf8Bytes.empty()) return false;
-    unsigned char b1 = utf8Bytes[0];
-    unsigned char b2 = (utf8Bytes.length() > 1) ? utf8Bytes[1] : 0;
+    static const std::pair<std::string, std::string> letters[] = {
+        {"Е", "е"}, 
+        {"П", "п"}, 
+        {"И", "и"},
+        {"К", "к"}, 
+        {"Р", "р"}, 
+        {"И", "и"}, 
+        {"З", "з"}, 
+        {"А", "а"}  
+    };
 
-    if (b1 == 0xD0 || b1 == 0xD1) {
-        switch (letterIndex) {
-            case 0: return (b2 == 0x95 || b2 == 0xB5);
-            case 1: return (b2 == 0x9F || b2 == 0xBF);
-            case 2: 
-            case 5: return (b2 == 0x98 || b2 == 0xB8);
-            case 3: return (b2 == 0x9A || b2 == 0xBA);
-            case 4: return (b2 == 0xA0 || b2 == 0xB0);
-            case 6: return (b2 == 0x97 || b2 == 0xB7);
-            case 7: return (b2 == 0x90 || b2 == 0xB0);
-            default: break;
-        }
+    if (letterIndex < 0 || letterIndex >= 8) {
+        return false;
     }
-    return false;
+
+    return (utf8Bytes == letters[letterIndex].first || utf8Bytes == letters[letterIndex].second);
 }
 
-std::vector<size_t> findEpicrisisPositions(const std::string& content) {
-    std::vector<size_t> positions;
-    std::vector<Utf8Char> chars = decodeUtf8(content);
-    size_t targetLen = 8;
+std::vector<std::size_t> findEpicrisisPositions(const std::string& content) {
+    std::vector<std::size_t> positions;
+    const std::vector<Utf8Char> chars = decodeUtf8(content);
+    const std::size_t targetLen = 8;
 
-    for (size_t i = 0; i < chars.size(); ++i) {
-        size_t charIdx = i;
-        size_t matchCount = 0;
-        size_t startByteOffset = chars[i].byteOffset;
+    for (std::size_t i = 0; i < chars.size(); ++i) {
+        std::size_t charIdx = i;
+        std::size_t matchCount = 0;
+        const std::size_t startByteOffset = chars[i].byteOffset;
 
         while (charIdx < chars.size() && matchCount < targetLen) {
-            std::string currBytes = chars[charIdx].bytes;
-            bool isWhitespace = (currBytes.length() == 1 && 
+            const std::string& currBytes = chars[charIdx].bytes;
+            const bool isWhitespace = (currBytes.length() == 1 && 
                 (currBytes[0] == ' ' || currBytes[0] == '\t' || currBytes[0] == '\r' || currBytes[0] == '\n'));
 
             if (isWhitespace) {
@@ -168,7 +126,7 @@ std::vector<size_t> findEpicrisisPositions(const std::string& content) {
                 continue;
             }
 
-            if (matchesEpicrisisLetter(currBytes, matchCount)) {
+            if (matchesEpicrisisLetter(currBytes, static_cast<int>(matchCount))) {
                 matchCount++;
                 charIdx++;
             } else {
@@ -183,19 +141,71 @@ std::vector<size_t> findEpicrisisPositions(const std::string& content) {
     return positions;
 }
 
+struct FieldLocation {
+    std::string fieldName;
+    std::size_t headerStart;
+    std::size_t contentStart;
+};
+
+std::map<std::string, std::string> parseEpicrisis(const std::string& text) {
+    std::map<std::string, std::string> data;
+    for (const auto& field : FIELDS) {
+        data[field] = "";
+    }
+
+    std::vector<FieldLocation> foundFields;
+
+    for (const auto& field : FIELDS) {
+        std::regex fieldRegex(field + R"(\s*:\s*)", std::regex::icase);
+        std::smatch match;
+        if (std::regex_search(text, match, fieldRegex)) {
+            foundFields.push_back({
+                field,
+                static_cast<std::size_t>(match.position()),
+                static_cast<std::size_t>(match.position() + match.length())
+            });
+        }
+    }
+
+    if (foundFields.empty()) {
+        return data;
+    }
+
+    std::sort(foundFields.begin(), foundFields.end(), 
+        [](const FieldLocation& a, const FieldLocation& b) {
+            return a.headerStart < b.headerStart;
+        });
+
+    for (std::size_t i = 0; i < foundFields.size(); ++i) {
+        const std::size_t start = foundFields[i].contentStart;
+        const std::size_t end = (i + 1 < foundFields.size()) ? foundFields[i + 1].headerStart : text.length();
+
+        if (end >= start) {
+            data[foundFields[i].fieldName] = trim(text.substr(start, end - start));
+        }
+    }
+
+    return data;
+}
+
 std::string readFileContent(const fs::path& filePath, const std::string& ext) {
-    std::string content = "";
-    
+    std::string content;
+
     if (ext == ".docx" || ext == ".doc") {
         std::string command = "textutil -convert txt -stdout \"" + filePath.string() + "\" 2>/dev/null";
         FILE* pipe = popen(command.c_str(), "r");
-        if (!pipe) return "";
-        
-        char buffer[256];
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            content += buffer;
+        if (!pipe) {
+            command = "pandoc -f docx -t plain \"" + filePath.string() + "\" 2>/dev/null";
+            pipe = popen(command.c_str(), "r");
         }
-        pclose(pipe);
+
+        if (pipe) {
+            char buffer[512];
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                content += buffer;
+            }
+            pclose(pipe);
+        }
     } else {
         std::ifstream file(filePath, std::ios::binary);
         if (!file.is_open()) return "";
@@ -203,31 +213,51 @@ std::string readFileContent(const fs::path& filePath, const std::string& ext) {
         bufferStream << file.rdbuf();
         content = bufferStream.str();
     }
-    
+
     return content;
 }
 
-void processDocuments(const fs::path& folderPath) {
+std::string escapeCsvField(const std::string& field) {
+    std::string escaped = "\"";
+    for (char c : field) {
+        if (c == '"') {
+            escaped += "\"\"";
+        } else if (c != '\r' && c != '\n') {
+            escaped += c;
+        } else {
+            escaped += " ";
+        }
+    }
+    escaped += "\"";
+    return escaped;
+}
+
+} // namespace
+
+void processDocuments(const fs::path& folderPath, const fs::path& outputDir) {
     int epicrisisCount = 0;
     int fileIndex = 1;
-    
-    std::string homeDir = std::getenv("HOME") ? std::getenv("HOME") : ".";
-    fs::path outputDir = fs::path(homeDir) / "Desktop" / "epicrisies_info_extract";
-    
-    fs::create_directories(outputDir); 
+
+    fs::path finalOutputDir = outputDir;
+    if (finalOutputDir.empty()) {
+        const char* homeDir = std::getenv("HOME");
+        finalOutputDir = fs::path(homeDir ? homeDir : ".") / "Desktop" / "epicrisies_info_extract";
+    }
+
+    fs::create_directories(finalOutputDir);
 
     std::ofstream csvFile;
-    
+
     auto openNewCsv = [&](int index) {
         if (csvFile.is_open()) csvFile.close();
-        
-        fs::path outFilePath = outputDir / ("epicrisies_info_" + std::to_string(index) + ".csv");
+
+        fs::path outFilePath = finalOutputDir / ("epicrisies_info_" + std::to_string(index) + ".csv");
         csvFile.open(outFilePath, std::ios::out | std::ios::binary);
-        
+
         unsigned char bom[] = {0xEF, 0xBB, 0xBF};
-        csvFile.write((char*)bom, sizeof(bom));
-        
-        for (size_t i = 0; i < FIELDS.size(); ++i) {
+        csvFile.write(reinterpret_cast<char*>(bom), sizeof(bom));
+
+        for (std::size_t i = 0; i < FIELDS.size(); ++i) {
             csvFile << "\"" << FIELDS[i] << "\"";
             if (i + 1 < FIELDS.size()) csvFile << ",";
         }
@@ -237,57 +267,59 @@ void processDocuments(const fs::path& folderPath) {
     openNewCsv(fileIndex);
 
     for (const auto& entry : fs::directory_iterator(folderPath)) {
-        if (entry.is_regular_file()) {
-            std::string ext = entry.path().extension().string();
-            for (auto& c : ext) c = std::tolower(c);
-            
-            if (ext != ".txt" && ext != ".md" && ext != ".csv" && ext != ".docx" && ext != ".doc") {
-                continue; 
-            }
-            
-            if (entry.path().filename().string().rfind("epicrisies_export_", 0) == 0) {
+        if (!entry.is_regular_file()) continue;
+
+        std::string ext = entry.path().extension().string();
+        for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        if (ext != ".txt" && ext != ".md" && ext != ".csv" && ext != ".docx" && ext != ".doc") {
+            continue;
+        }
+
+        if (entry.path().filename().string().rfind("epicrisies_export_", 0) == 0) {
+            continue;
+        }
+
+        std::string content = readFileContent(entry.path(), ext);
+        if (content.empty()) continue;
+
+        if (content.length() >= 3 &&
+            static_cast<unsigned char>(content[0]) == 0xEF &&
+            static_cast<unsigned char>(content[1]) == 0xBB &&
+            static_cast<unsigned char>(content[2]) == 0xBF) {
+            content.erase(0, 3);
+        }
+
+        std::vector<std::size_t> positions = findEpicrisisPositions(content);
+
+        for (std::size_t i = 0; i < positions.size(); ++i) {
+            std::size_t start = positions[i];
+            std::size_t length = (i + 1 < positions.size()) ? (positions[i + 1] - start) : (content.length() - start);
+            std::string singleEpicrisis = content.substr(start, length);
+
+            auto parsedData = parseEpicrisis(singleEpicrisis);
+
+            if (parsedData["Окончателна диагноза"].empty()) {
                 continue;
             }
 
-            std::string content = readFileContent(entry.path(), ext);
-            if (content.empty()) continue;
-
-            if (content.length() >= 3 && 
-                (unsigned char)content[0] == 0xEF && 
-                (unsigned char)content[1] == 0xBB && 
-                (unsigned char)content[2] == 0xBF) {
-                content.erase(0, 3);
+            if (epicrisisCount > 0 && epicrisisCount % 100 == 0) {
+                fileIndex++;
+                openNewCsv(fileIndex);
             }
 
-            std::vector<size_t> positions = findEpicrisisPositions(content);
-            
-            for (size_t i = 0; i < positions.size(); ++i) {
-                size_t start = positions[i];
-                size_t length = (i + 1 < positions.size()) ? (positions[i + 1] - start) : (content.length() - start);
-                std::string singleEpicrisis = content.substr(start, length);
-                
-                auto parsedData = parseEpicrisis(singleEpicrisis);
-                
-                if (parsedData["Окончателна диагноза"].empty()) {
-                    continue; 
-                }
-                
-                if (epicrisisCount > 0 && epicrisisCount % 100 == 0) {
-                    fileIndex++;
-                    openNewCsv(fileIndex);
-                }
-                
-                for (size_t j = 0; j < FIELDS.size(); ++j) {
-                    csvFile << escapeCsvField(parsedData[FIELDS[j]]);
-                    if (j + 1 < FIELDS.size()) csvFile << ",";
-                }
-                csvFile << "\n";
-                epicrisisCount++;
+            for (std::size_t j = 0; j < FIELDS.size(); ++j) {
+                csvFile << escapeCsvField(parsedData[FIELDS[j]]);
+                if (j + 1 < FIELDS.size()) csvFile << ",";
             }
+            csvFile << "\n";
+            epicrisisCount++;
         }
     }
-    
-    if (csvFile.is_open()) csvFile.close();
+
+    if (csvFile.is_open()) {
+        csvFile.close();
+    }
 }
 
-}
+} // namespace extractor

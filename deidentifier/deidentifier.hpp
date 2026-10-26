@@ -16,14 +16,18 @@ struct DeidentificationResult {
 
 class Deidentifier {
 public:
+    Deidentifier() = default;
+
+    void reset();
+
     DeidentificationResult deidentifyText(const std::string& text);
 
 private:
-    std::vector<DetectedEntity> resolveOverlaps(std::vector<DetectedEntity> entities) const;
     std::string getPseudonym(const std::string& entityText, EntityType type);
 
     EntityDetector detector_;
     std::unordered_map<std::string, std::string> pseudonyms_;
+    std::unordered_map<int, std::size_t> typeCounters_;
 };
 
 } // namespace deid

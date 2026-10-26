@@ -1,10 +1,13 @@
 #include "file_processor.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <set>
 #include <sstream>
 
@@ -22,6 +25,25 @@ std::string normalizedExtension(const fs::path& path) {
             return static_cast<char>(std::tolower(character));
         });
     return extension;
+}
+
+std::string escapeShellArg(const std::string& arg) {
+    std::string escaped = "\"";
+    for (char c : arg) {
+        if (c == '"' || c == '\\' || c == '$' || c == '`') {
+            escaped += '\\';
+        }
+        escaped += c;
+    }
+    escaped += "\"";
+    return escaped;
+}
+
+fs::path generateUniqueTempPath(const std::string& prefix, const std::string& ext) {
+    static std::atomic<std::uint64_t> counter{0};
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto uniqueId = std::to_string(now) + "_" + std::to_string(++counter);
+    return fs::temp_directory_path() / (prefix + "_" + uniqueId + ext);
 }
 
 class TextDocumentParser : public IDocumentParser {
@@ -42,53 +64,47 @@ public:
     }
 };
 
-class CsvDocumentParser : public TextDocumentParser {
-public:
-    std::string extractText(const fs::path& filePath) override {
-        return TextDocumentParser::extractText(filePath);
-    }
-
-    bool writeText(const fs::path& outputPath, const std::string& content) override {
-        return TextDocumentParser::writeText(outputPath, content);
-    }
-};
-
 class BinaryDocumentParser : public IDocumentParser {
 public:
     explicit BinaryDocumentParser(std::string ext) : ext_(std::move(ext)) {}
 
     std::string extractText(const fs::path& filePath) override {
         std::string command;
-        fs::path tempOutput = fs::temp_directory_path() / "deid_extracted.txt";
+        const fs::path tempOutput = generateUniqueTempPath("deid_extract", ".txt");
 
         if (ext_ == ".pdf") {
-            command = "pdftotext \"" + filePath.string() + "\" \"" + tempOutput.string() + "\" 2>/dev/null";
+            command = "pdftotext " + escapeShellArg(filePath.string()) + " " + escapeShellArg(tempOutput.string()) + " 2>/dev/null";
         } else if (ext_ == ".docx" || ext_ == ".doc") {
-            command = "pandoc \"" + filePath.string() + "\" -t plain -o \"" + tempOutput.string() + "\" 2>/dev/null";
+            command = "pandoc " + escapeShellArg(filePath.string()) + " -t plain -o " + escapeShellArg(tempOutput.string()) + " 2>/dev/null";
         }
 
+        std::string extracted;
         if (!command.empty() && std::system(command.c_str()) == 0 && fs::exists(tempOutput)) {
             TextDocumentParser textParser;
-            std::string extracted = textParser.extractText(tempOutput);
-            fs::remove(tempOutput);
+            extracted = textParser.extractText(tempOutput);
+            std::error_code ec;
+            fs::remove(tempOutput, ec);
             if (!extracted.empty()) return extracted;
         }
+
+        std::error_code ec;
+        fs::remove(tempOutput, ec);
 
         TextDocumentParser fallback;
         return fallback.extractText(filePath);
     }
 
     bool writeText(const fs::path& outputPath, const std::string& content) override {
-        fs::path tempTxt = fs::temp_directory_path() / "deid_temp_output.txt";
+        const fs::path tempTxt = generateUniqueTempPath("deid_render", ".txt");
         {
             std::ofstream tempOut(tempTxt, std::ios::binary);
             if (!tempOut) return false;
             tempOut << content;
         }
 
-        std::string command = "pandoc \"" + tempTxt.string() + "\" -o \"" + outputPath.string() + "\" 2>/dev/null";
-
         bool success = false;
+        std::string command = "pandoc " + escapeShellArg(tempTxt.string()) + " -o " + escapeShellArg(outputPath.string()) + " 2>/dev/null";
+
         if (std::system(command.c_str()) == 0 && fs::exists(outputPath)) {
             success = true;
         } else {
@@ -99,7 +115,8 @@ public:
             }
         }
 
-        fs::remove(tempTxt);
+        std::error_code ec;
+        fs::remove(tempTxt, ec);
         return success;
     }
 
@@ -110,10 +127,8 @@ private:
 } // namespace
 
 std::unique_ptr<IDocumentParser> createParserForExtension(const std::string& extension) {
-    if (extension == ".txt" || extension == ".md") {
+    if (extension == ".txt" || extension == ".md" || extension == ".csv") {
         return std::make_unique<TextDocumentParser>();
-    } else if (extension == ".csv") {
-        return std::make_unique<CsvDocumentParser>();
     } else if (extension == ".pdf" || extension == ".doc" || extension == ".docx") {
         return std::make_unique<BinaryDocumentParser>(extension);
     }
@@ -126,7 +141,7 @@ fs::path getInputFolder(int argc, char* argv[]) {
     }
 
     std::string input;
-    std::cout << "Enter the folder path: ";
+    std::cout << "Въведете път към папката с документи: ";
     std::getline(std::cin, input);
     return input;
 }
@@ -186,12 +201,12 @@ FileResult processFile(
     auto parser = createParserForExtension(ext);
     
     if (!parser) {
-        return {FileStatus::Skipped, 0, "Skipped: unhandled file extension."};
+        return {FileStatus::Skipped, 0, "Пропуснат: неподдържан формат на файла (" + ext + ")"};
     }
 
     std::string rawContent = parser->extractText(inputFile);
     if (rawContent.empty()) {
-        return {FileStatus::Failed, 0, "Failed: could not read or extract document text."};
+        return {FileStatus::Failed, 0, "Грешка: неуспешно четене или празен документ."};
     }
 
     const std::string cleanedContent = MetadataProcessor::stripMetadata(rawContent, inputFile);
@@ -201,21 +216,24 @@ FileResult processFile(
     std::error_code error;
     const fs::path relativePath = fs::relative(inputFile, inputRoot, error);
     if (error) {
-        return {FileStatus::Failed, 0, "Failed: could not calculate output path."};
+        return {FileStatus::Failed, 0, "Грешка: неуспешно изчисляване на изходния път."};
     }
 
     const fs::path outputFile = outputRoot / relativePath;
     fs::create_directories(outputFile.parent_path(), error);
     if (error) {
-        return {FileStatus::Failed, 0, "Failed: could not create output folder."};
+        return {FileStatus::Failed, 0, "Грешка: директорията не може да бъде създадена."};
     }
 
     if (!parser->writeText(outputFile, deidentified.text)) {
-        return {FileStatus::Failed, 0, "Failed: writing deidentified document failed."};
+        return {FileStatus::Failed, 0, "Грешка: записът на анонимизирания файл беше неуспешен."};
     }
 
-    return {FileStatus::Processed, deidentified.redactions,
-        "Processed (" + ext + "): " + std::to_string(deidentified.redactions) + " redaction(s)."};
+    return {
+        FileStatus::Processed, 
+        deidentified.redactions,
+        "Обработен (" + ext + "): " + std::to_string(deidentified.redactions) + " редакции."
+    };
 }
 
 void addToSummary(ProcessingSummary& summary, const FileResult& result) {

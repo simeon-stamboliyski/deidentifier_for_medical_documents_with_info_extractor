@@ -254,10 +254,6 @@ void processDocuments(const fs::path& folderPath, const fs::path& outputDir) {
     int fileIndex = 1;
 
     fs::path finalOutputDir = outputDir;
-    if (finalOutputDir.empty()) {
-        const char* homeDir = std::getenv("HOME");
-        finalOutputDir = fs::path(homeDir ? homeDir : ".") / "Desktop" / "epicrisies_info_extract";
-    }
 
     fs::create_directories(finalOutputDir);
 

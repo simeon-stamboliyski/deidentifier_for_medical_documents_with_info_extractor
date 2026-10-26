@@ -18,8 +18,6 @@ class Deidentifier {
 public:
     Deidentifier() = default;
 
-    void reset();
-
     DeidentificationResult deidentifyText(const std::string& text);
 
 private:
@@ -28,7 +26,6 @@ private:
 
     EntityDetector detector_;
     std::unordered_map<std::string, std::string> pseudonyms_;
-    std::unordered_map<int, std::size_t> typeCounters_;
 };
 
 } // namespace deid

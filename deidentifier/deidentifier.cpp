@@ -116,8 +116,6 @@ bool validUtf8(const std::string& s) {
     return true;
 }
 
-// Ensure a replacement does not begin or end
-// in the middle of a UTF-8 character.
 bool utf8Boundary(
     const std::string& s,
     std::size_t position)
@@ -127,34 +125,6 @@ bool utf8Boundary(
          & 0xC0) != 0x80;
 }
 
-// Translate an index in Unicode code points into a UTF-8 byte
-// offset. This is valid only when the detector counts code points
-// (not UTF-16 code units or words). The source text must be valid UTF-8.
-bool codepointIndexToByteOffset(
-    const std::string& text,
-    std::size_t codepointIndex,
-    std::size_t& byteOffset)
-{
-    byteOffset = 0;
-    std::size_t index = 0;
-
-    while (index < codepointIndex && byteOffset < text.size()) {
-        const auto first =
-            static_cast<unsigned char>(text[byteOffset]);
-
-        if (first <= 0x7F) byteOffset += 1;
-        else if (first <= 0xDF) byteOffset += 2;
-        else if (first <= 0xEF) byteOffset += 3;
-        else byteOffset += 4;
-
-        ++index;
-    }
-
-    return index == codepointIndex;
-}
-
-// Verify that a detected entity actually matches the original
-// UTF-8 input at a byte offset, without reading outside the string.
 bool matchesByteSpan(
     const std::string& text,
     std::size_t start,
@@ -184,9 +154,6 @@ std::size_t countPattern(
     return count;
 }
 
-// True if the UTF-8 text includes characters in the
-// Cyrillic block U+0400-U+04FF (including Bulgarian).
-// Called only after validUtf8(text) succeeds.
 bool containsCyrillic(const std::string& text) {
     for (std::size_t i = 0; i + 1 < text.size(); ++i) {
         const auto first =
@@ -194,7 +161,6 @@ bool containsCyrillic(const std::string& text) {
         const auto second =
             static_cast<unsigned char>(text[i + 1]);
 
-        // U+0400-U+04FF encodes as D0..D3 + continuation.
         if (first >= 0xD0 && first <= 0xD3 &&
             (second & 0xC0) == 0x80) {
             return true;
@@ -203,20 +169,12 @@ bool containsCyrillic(const std::string& text) {
     return false;
 }
 
-// Cyrillic-specific mojibake *heuristic*.
-// Examples: София -> Ð¡Ð¾Ñ„Ð¸Ñ or РЎРѕС„РёСЏ.
-// Look for NEW suspicious sequences; don't fail merely
-// because an existing input already contains one.
 bool introducesCyrillicMojibake(
     const std::string& before,
     const std::string& after)
 {
-    // Keep this source file encoded in UTF-8.
-    // Ð / Ñ: UTF-8 lead bytes for Cyrillic misread as
-    //         Latin-1/Windows-1252.
-    // Р... / С...: UTF-8 Cyrillic misread as Windows-1251.
     const std::array<std::string, 17> patterns = {
-        "\xEF\xBF\xBD", // replacement character U+FFFD
+        "\xEF\xBF\xBD", 
         "Ð", "Ñ",
         "Рџ", "РЎ", "Рѕ", "Рё", "Рµ", "Р°", "РІ",
         "СЂ", "С‚", "С„", "СЏ", "Рђ", "Рґ", "Сѓ"
@@ -261,39 +219,19 @@ DeidentificationResult Deidentifier::deidentifyText(
             "Input is not valid UTF-8");
     }
 
-    // Decide once whether Cyrillic mojibake checks apply.
     const bool cyrillicInput = containsCyrillic(text);
 
-    // Detect all entities ONCE.
     auto detected = detector_.detectAll(text);
 
-    // Convert detector offsets to verified UTF-8 byte spans.
-    // Detectors may count Unicode code points instead of bytes,
-    // particularly when Bulgarian/Cyrillic text precedes an ID.
-    // Every corrected span is checked against the original input.
+    
     for (auto& e : detected) {
-        const bool byteMatch =
-            matchesByteSpan(text, e.start, e.text);
+        if (!matchesByteSpan(text, e.start, e.text)) {
+            const std::size_t firstMatch =
+                text.find(e.text);
 
-        std::size_t convertedStart = 0;
-        const bool cpOffsetExists =
-            codepointIndexToByteOffset(text, e.start, convertedStart);
-        const bool codepointMatch = cpOffsetExists &&
-            matchesByteSpan(text, convertedStart, e.text);
-
-        if (!byteMatch && codepointMatch) {
-            std::cerr
-                << "[OFFSET FIX] " << entityTypeToString(e.type)
-                << ": codepoint offset " << e.start
-                << " -> UTF-8 byte offset " << convertedStart
-                << '\n';
-            e.start = convertedStart;
-        } else if (!byteMatch) {
-            // Diagnostic metadata only; do NOT print e.text,
-            // because identifiers may be sensitive.
-            const std::size_t firstMatch = text.find(e.text);
             const bool existsElsewhere =
-                !e.text.empty() && firstMatch != std::string::npos;
+                !e.text.empty() &&
+                firstMatch != std::string::npos;
 
             std::cerr
                 << "[INVALID SPAN] type="
@@ -311,19 +249,19 @@ DeidentificationResult Deidentifier::deidentifyText(
                 entityTypeToString(e.type));
         }
 
-        // The validated text determines the correct byte length.
-        // Some detectors report e.length in Unicode characters.
         if (e.length != e.text.size()) {
             std::cerr
-                << "[LENGTH FIX] " << entityTypeToString(e.type)
+                << "[LENGTH FIX] "
+                << entityTypeToString(e.type)
                 << ": reported length " << e.length
-                << " -> UTF-8 byte length " << e.text.size()
+                << " -> UTF-8 byte length "
+                << e.text.size()
                 << '\n';
+
             e.length = e.text.size();
         }
     }
 
-    // Prevent conflicting replacements.
     const auto entities =
         resolveOverlaps(std::move(detected));
 
@@ -348,8 +286,6 @@ DeidentificationResult Deidentifier::deidentifyText(
     std::vector<Replacement> committed;
     std::string currentText = text;
 
-    // Rebuild every intermediate result from the
-    // original text, preserving original offsets.
     auto render = [&](std::vector<Replacement> replacements) {
         std::sort(
             replacements.begin(),
@@ -383,21 +319,17 @@ DeidentificationResult Deidentifier::deidentifyText(
         return output;
     };
 
-    // Preserve pseudonym state if processing fails.
     const auto oldPseudonyms = pseudonyms_;
 
     try {
-        // Process exactly ONE TYPE at a time.
         for (EntityType type : order) {
             const std::string name =
                 entityTypeToString(type);
 
             std::cout << "[START] " << name << '\n';
 
-            // Stage previously accepted replacements.
             auto proposed = committed;
 
-            // Add replacements belonging to this type.
             for (const auto& e : entities) {
                 if (e.type != type)
                     continue;
@@ -409,15 +341,10 @@ DeidentificationResult Deidentifier::deidentifyText(
                 });
             }
 
-            // Build candidate WITHOUT committing it.
             std::string candidate = render(proposed);
 
-            // Check the entire candidate after this type.
             const bool utf8OK = validUtf8(candidate);
 
-            // Only run Cyrillic mojibake heuristics when
-            // the original input contains Cyrillic text.
-            // UTF-8 validity is checked for ALL input.
             const bool mojibake =
                 cyrillicInput &&
                 introducesCyrillicMojibake(
@@ -435,14 +362,11 @@ DeidentificationResult Deidentifier::deidentifyText(
                     << " | New Cyrillic mojibake: " << mojibake
                     << '\n';
 
-                // Stop rather than return text containing
-                // identifiers that might not be redacted.
                 throw std::runtime_error(
                     "Deidentification failed at type: " +
                     name);
             }
 
-            // Passed validation: commit this type.
             committed = std::move(proposed);
             currentText = std::move(candidate);
 
@@ -506,7 +430,6 @@ std::string Deidentifier::getPseudonym(
     const std::string& entityText,
     EntityType type)
 {
-    // Include type in the key to avoid collisions.
     const std::string key =
         entityTypeToString(type) + ":" +
         toLowerUtf8(entityText);

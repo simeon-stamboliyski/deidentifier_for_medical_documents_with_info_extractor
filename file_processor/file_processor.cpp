@@ -78,6 +78,12 @@ public:
             command = "textutil -convert txt -encoding utf-8 -output "
                     + escapeShellArg(tempOutput.string()) + " "
                     + escapeShellArg(filePath.string()) + " 2>/dev/null";
+        } else if (ext_ == ".odt") {
+            command = "pandoc " +
+                escapeShellArg(filePath.string()) +
+                " -f odt -t plain --wrap=none -o " +
+                escapeShellArg(tempOutput.string()) +
+                " 2>/dev/null";
         }
 
         std::string extracted;
@@ -99,7 +105,7 @@ public:
     bool writeText(const fs::path& outputPath, const std::string& content) override {
         bool success = false;
 
-        if (ext_ == ".docx" || ext_ == ".doc") {
+        if (ext_ == ".docx" || ext_ == ".doc" || ext_ == ".odt") {
             const fs::path tempTxt = generateUniqueTempPath("deid_render", ".txt");
             {
                 std::ofstream tempOut(tempTxt, std::ios::binary);
@@ -136,9 +142,13 @@ public:
                 pandocOut.replace_extension(".docx");
             }
 
+            const std::string targetFormat =
+                (ext_ == ".odt") ? "odt" : "docx";
+
             std::string pandocCmd =
                 "pandoc " + escapeShellArg(tempTxt.string()) +
-                " -f markdown_strict-smart -t docx -o " +
+                " -f markdown_strict-smart -t " +
+                targetFormat + " -o " +
                 escapeShellArg(pandocOut.string()) +
                 " 2>/dev/null";
 
@@ -220,7 +230,8 @@ private:
 std::unique_ptr<IDocumentParser> createParserForExtension(const std::string& extension) {
     if (extension == ".txt" || extension == ".md" || extension == ".csv") {
         return std::make_unique<TextDocumentParser>();
-    } else if (extension == ".pdf" || extension == ".doc" || extension == ".docx") {
+    } else if (extension == ".pdf" || extension == ".doc" || extension == ".docx" ||
+               extension == ".odt") {
         return std::make_unique<BinaryDocumentParser>(extension);
     }
     return nullptr;
@@ -253,7 +264,8 @@ fs::path createOutputFolder(const fs::path& inputFolder) {
 
 std::vector<fs::path> findSupportedFiles(const fs::path& inputFolder) {
     const std::set<std::string> supportedExtensions = {
-        ".txt", ".md", ".csv", ".doc", ".docx", ".pdf"
+            ".txt", ".md", ".csv", ".doc",
+            ".docx", ".pdf", ".odt"
     };
 
     std::vector<fs::path> files;

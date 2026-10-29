@@ -161,14 +161,14 @@ EntityDetector::EntityDetector() {
             std::regex::icase
         )},
         {EntityType::Location, std::regex(
-            R"((?:гр\.|град|с\.|село|ул\.|улица|бул\.|булевард|ж\.?к\.?|кв\.|пл\.|площад)[ \t]+(?:[^\x80-\xFF\n,;().]|[\xC2-\xDF][\x80-\xBF]|[\xE0-\xEF][\x80-\xBF]{2}|[\xF0-\xF4][\x80-\xBF]{3}){2,40}(?:[ \t]+(?:№|No|бл\.|вх\.|ап\.|ет\.)[ \t]*\d+(?:[A-Za-z0-9 \t-]|[\xD0-\xD3][\x80-\xBF])*)?)",
+            R"((?:гр\.|град|с\.|село|ул\.|улица|бул\.|булевард|ж\.?к\.?|кв\.|пл\.|площад)[ \t]+(?:Св\.|(?![ \t]+(?:№|No|бл\.|вх\.|ап\.|ет\.))[^\x80-\xFF\n,;().]|[\xC2-\xDF][\x80-\xBF]|[\xE0-\xEF][\x80-\xBF]{2}|[\xF0-\xF4][\x80-\xBF]{3}){2,80}(?:[ \t]+(?:№|No|бл\.|вх\.|ап\.|ет\.)[ \t]*\d+(?:[A-Za-z]|[\xD0-\xD3][\x80-\xBF])?(?:[ \t]+(?:вх\.|ет\.|ап\.)[ \t]*(?:\d+(?:[A-Za-z]|[\xD0-\xD3][\x80-\xBF])?|[A-Za-z]|[\xD0-\xD3][\x80-\xBF]))*)?)",
             std::regex::icase
         )},
         {EntityType::Phone, std::regex(
             R"((?:\+359[\s./-]?|0)(?:\d{1,3}[\s./-]?)?\d{3}[\s./-]?\d{3,4}\b)"
         )},
         {EntityType::Date, std::regex(
-            R"(\b\d{1,2}[\./-]\d{1,2}[\./-]\d{2,4}\b|\b(?:\d{1,2}[\./-])?\d{4}\s*г(?:\.|одина)?\b|\b\d{1,2}\s+(?:януари|февруари|март|април|май|юни|юли|август|септември|октомври|ноември|декември)(?:\s+\d{2,4}(?:\s*г\.?)?)?\b)",
+            R"(м\.[ \t]*(?:0?[1-9]|1[0-2])\.[ \t]*(?:\d{4}|\d{2})(?:[ \t]*г(?:\.|одина)?)?|\b\d{1,2}[\./-]\d{1,2}[\./-][ \t]*\d{2,4}\b|\b(?:0?[1-9]|1[0-2])\.(?:\d{4}(?:[ \t]*г\.)?|\d{2}[ \t]*г\.)|\b(?:0?[1-9]|1[0-2])[ \t]*м\.[ \t]*\d{4}(?:[ \t]*г\.?)?|\b(?:\d{1,2}[\./-])?\d{4}\s*г(?:\.|одина)?\b|\b\d{1,2}\s+(?:януари|февруари|март|април|май|юни|юли|август|септември|октомври|ноември|декември)(?:\s+\d{2,4}(?:\s*г\.?)?)?\b)",
             std::regex::icase
         )},
         {EntityType::Email, std::regex(
@@ -212,8 +212,34 @@ void EntityDetector::detectRegex(const std::string& text, std::vector<DetectedEn
     for (const auto& [type, pattern] : regexes_) {
         for (std::sregex_iterator it(text.begin(), text.end(), pattern), end; it != end; ++it) {
             std::size_t len = static_cast<std::size_t>(it->length());
-            if (len <= 80) {
+            if (len <= (type == EntityType::Location ? 512u : 80u)) {
                 const auto pos = static_cast<std::size_t>(it->position());
+                if (type == EntityType::Location) {
+                    const std::string match = it->str();
+                    const bool isCity = match.rfind("гр.", 0) == 0;
+                    const bool isVillage = match.rfind("с.", 0) == 0;
+                    if (isCity || isVillage) {
+                        std::size_t nameStart = pos + (isCity ? std::string("гр.").size()
+                                                              : std::string("с.").size());
+                        while (nameStart < text.size() &&
+                               (text[nameStart] == ' ' || text[nameStart] == '\t')) ++nameStart;
+                        if (!isCyrillicUpper(text, nameStart)) continue;
+                    }
+                }
+                if (type == EntityType::Date) {
+                    const auto end = pos + len;
+                    if ((pos > 0 && (text[pos - 1] == '/' || text[pos - 1] == '.')) ||
+                        text.compare(end, 4, "мг") == 0 ||
+                        text.compare(end, 2, "mg") == 0) {
+                        continue;
+                    }
+                    if (it->str().find('-') != std::string::npos &&
+                        ((end < text.size() && text[end] == '-') ||
+                         (pos > 0 && text[pos - 1] == '-') ||
+                         (end < text.size() && text.compare(end, 2, "ч") == 0))) {
+                        continue;
+                    }
+                }
                 auto atBoundary = [&](std::size_t offset) {
                     return offset == text.size() ||
                         (static_cast<unsigned char>(text[offset]) & 0xC0) != 0x80;
@@ -317,6 +343,15 @@ void EntityDetector::detectRegex(const std::string& text, std::vector<DetectedEn
                          ((text[endNo] >= 'A' && text[endNo] <= 'Z') ||
                           (text[endNo] >= 'a' && text[endNo] <= 'z')))
                     ++endNo;
+                static const std::regex addressTail(
+                    R"((?:[ \t]+(?:вх\.?|ет\.?|ап\.?)[ \t]*(?:\d{1,4}(?:[A-Za-z]|[\xD0-\xD3][\x80-\xBF])?|[A-Za-z]|[\xD0-\xD3][\x80-\xBF]))+)"
+                );
+                std::smatch tail;
+                if (std::regex_search(text.cbegin() + endNo,
+                                      text.cbegin() + headerEnd, tail, addressTail,
+                                      std::regex_constants::match_continuous)) {
+                    endNo += tail.length();
+                }
                 if (!isWordAfter(text, endNo)) {
                     std::size_t streetEnd = no;
                     while (streetEnd > cityStart &&
@@ -499,7 +534,10 @@ void EntityDetector::detectNER(const std::string& text, std::vector<DetectedEnti
                 }
 
                 std::size_t totalLen = hasW3 ? (k + w3Len - i) : (j + w2Len - i);
-                if (totalLen <= 60) {
+                const std::string patientPrefix = "На ";
+                const bool afterPatientPrefix = i >= patientPrefix.size() &&
+                    text.compare(i - patientPrefix.size(), patientPrefix.size(), patientPrefix) == 0;
+                if (totalLen <= 60 && (hasW3 || afterPatientPrefix)) {
                     results.push_back({
                         EntityType::Person,
                         i,

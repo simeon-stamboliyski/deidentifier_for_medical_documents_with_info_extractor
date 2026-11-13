@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <regex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace deid {

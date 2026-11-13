@@ -1,12 +1,24 @@
 #include "detectors.hpp"
+
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
+#include <regex>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
+#include <vector>
 
 namespace deid {
 
 namespace {
+
+constexpr bool kMaskStandaloneYears = false;
+
+constexpr std::size_t npos = std::string::npos;
+
+#define CYR_UP R"((?:\xD0[\x80-\xAF]))"
+#define CYR_LO R"((?:\xD0[\xB0-\xBF]|\xD1[\x80-\x9F]))"
 
 std::size_t getUtf8SequenceLength(unsigned char leadByte) {
     if ((leadByte & 0x80) == 0) return 1;
@@ -15,6 +27,41 @@ std::size_t getUtf8SequenceLength(unsigned char leadByte) {
     if ((leadByte & 0xF8) == 0xF0) return 4;
     return 1;
 }
+
+char32_t decodeAt(const std::string& s, std::size_t pos, std::size_t* len) {
+    if (pos >= s.size()) {
+        if (len) *len = 0;
+        return 0;
+    }
+    const auto b0 = static_cast<unsigned char>(s[pos]);
+    std::size_t n = getUtf8SequenceLength(b0);
+    if (pos + n > s.size()) n = 1;
+    char32_t cp = 0;
+    switch (n) {
+        case 1: cp = b0; break;
+        case 2: cp = static_cast<char32_t>(((b0 & 0x1F) << 6) | (s[pos + 1] & 0x3F)); break;
+        case 3: cp = static_cast<char32_t>(((b0 & 0x0F) << 12) | ((s[pos + 1] & 0x3F) << 6) |
+                                           (s[pos + 2] & 0x3F)); break;
+        default: cp = static_cast<char32_t>(((b0 & 0x07) << 18) | ((s[pos + 1] & 0x3F) << 12) |
+                                            ((s[pos + 2] & 0x3F) << 6) | (s[pos + 3] & 0x3F)); break;
+    }
+    if (len) *len = n;
+    return cp;
+}
+
+char32_t prevCodepoint(const std::string& s, std::size_t pos) {
+    if (pos == 0) return 0;
+    std::size_t p = pos - 1;
+    while (p > 0 && (static_cast<unsigned char>(s[p]) & 0xC0) == 0x80) --p;
+    return decodeAt(s, p, nullptr);
+}
+
+bool isCyrUpper(char32_t c) { return c >= 0x400 && c <= 0x42F; }
+bool isCyrLower(char32_t c) { return c >= 0x430 && c <= 0x45F; }
+bool isUpperLetter(char32_t c) { return (c >= 'A' && c <= 'Z') || isCyrUpper(c); }
+bool isLowerLetter(char32_t c) { return (c >= 'a' && c <= 'z') || isCyrLower(c); }
+bool isLetter(char32_t c) { return isUpperLetter(c) || isLowerLetter(c); }
+bool isAsciiDigit(char c) { return c >= '0' && c <= '9'; }
 
 bool isWordBefore(const std::string& text, std::size_t position) {
     if (position == 0) return false;
@@ -40,6 +87,79 @@ bool isWordAfter(const std::string& text, std::size_t position) {
     const auto lead = static_cast<unsigned char>(text[position]);
     return (lead < 128 && (std::isalnum(lead) != 0 || lead == '_')) ||
            (lead >= 0xD0 && lead <= 0xD3);
+}
+
+std::string lowerUtf8(const std::string& s) {
+    std::string out = s;
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const auto c = static_cast<unsigned char>(out[i]);
+        if (c >= 'A' && c <= 'Z') {
+            out[i] = static_cast<char>(c + 32);
+        } else if (c == 0xD0 && i + 1 < out.size()) {
+            const auto d = static_cast<unsigned char>(out[i + 1]);
+            if (d >= 0x80 && d <= 0x8F) {
+                out[i] = static_cast<char>(0xD1);
+                out[i + 1] = static_cast<char>(d + 0x10);
+            } else if (d >= 0x90 && d <= 0x9F) {
+                out[i + 1] = static_cast<char>(d + 0x20);
+            } else if (d >= 0xA0 && d <= 0xAF) {
+                out[i] = static_cast<char>(0xD1);
+                out[i + 1] = static_cast<char>(d - 0x20);
+            }
+            ++i;
+        } else if (c == 0xD1) {
+            ++i;
+        }
+    }
+    return out;
+}
+
+std::string upperUtf8(const std::string& s) {
+    std::string out = s;
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const auto c = static_cast<unsigned char>(out[i]);
+        if (c >= 'a' && c <= 'z') {
+            out[i] = static_cast<char>(c - 32);
+        } else if (c == 0xD0 && i + 1 < out.size()) {
+            const auto d = static_cast<unsigned char>(out[i + 1]);
+            if (d >= 0xB0 && d <= 0xBF) out[i + 1] = static_cast<char>(d - 0x20);
+            ++i;
+        } else if (c == 0xD1 && i + 1 < out.size()) {
+            const auto d = static_cast<unsigned char>(out[i + 1]);
+            if (d >= 0x80 && d <= 0x8F) {
+                out[i] = static_cast<char>(0xD0);
+                out[i + 1] = static_cast<char>(d + 0x20);
+            } else if (d >= 0x90 && d <= 0x9F) {
+                out[i] = static_cast<char>(0xD0);
+                out[i + 1] = static_cast<char>(d - 0x10);
+            }
+            ++i;
+        }
+    }
+    return out;
+}
+
+bool isSpaceAt(const std::string& t, std::size_t pos, std::size_t* len) {
+    if (pos >= t.size()) return false;
+    if (t[pos] == ' ' || t[pos] == '\t') { *len = 1; return true; }
+    if (static_cast<unsigned char>(t[pos]) == 0xC2 && pos + 1 < t.size() &&
+        static_cast<unsigned char>(t[pos + 1]) == 0xA0) { *len = 2; return true; }
+    return false;
+}
+
+std::size_t skipSpaces(const std::string& t, std::size_t pos) {
+    std::size_t l = 0;
+    while (isSpaceAt(t, pos, &l)) pos += l;
+    return pos;
+}
+
+std::size_t skipSpacesBack(const std::string& t, std::size_t pos) {
+    while (pos > 0 && (t[pos - 1] == ' ' || t[pos - 1] == '\t')) --pos;
+    return pos;
+}
+
+bool startsWith(const std::string& s, std::size_t pos, const std::string& prefix) {
+    return s.compare(pos, prefix.size(), prefix) == 0;
 }
 
 bool isValidEGN(const std::string& str) {
@@ -94,62 +214,361 @@ bool isValidUIN(const std::string& str) {
     return (region >= 1 && region <= 28);
 }
 
-bool isCyrillicUpper(const std::string& str, std::size_t pos) {
-    if (pos + 1 >= str.size()) return false;
-    unsigned char c1 = static_cast<unsigned char>(str[pos]);
-    unsigned char c2 = static_cast<unsigned char>(str[pos + 1]);
-
-    if (c1 == 0xD0 && (c2 >= 0x90 && c2 <= 0xAF)) return true;
-    if (c1 == 0xD0 && c2 == 0x8D) return true; // Ѝ
-
-    return false;
-}
-
-bool isCyrillicLower(const std::string& str, std::size_t pos) {
-    if (pos + 1 >= str.size()) return false;
-    unsigned char c1 = static_cast<unsigned char>(str[pos]);
-    unsigned char c2 = static_cast<unsigned char>(str[pos + 1]);
-
-    if (c1 == 0xD0 && (c2 >= 0xB0 && c2 <= 0xBF)) return true;
-    if (c1 == 0xD1 && (c2 >= 0x80 && c2 <= 0x8F)) return true;
-    if (c1 == 0xD1 && c2 == 0x9D) return true; // ѝ
-
-    return false;
-}
-
-bool isCapitalizedWord(const std::string& text, std::size_t start, std::size_t& outLen) {
-    if (start >= text.size() || !isCyrillicUpper(text, start)) {
-        return false;
+std::size_t nameWordLength(const std::string& t, std::size_t pos, bool allowAllCaps) {
+    std::size_t len = 0;
+    const char32_t first = decodeAt(t, pos, &len);
+    if (!isCyrUpper(first)) return 0;
+    std::size_t i = pos + len;
+    std::size_t letters = 1;
+    bool sawLower = false;
+    bool sawUpper = false;
+    while (i < t.size()) {
+        std::size_t l = 0;
+        const char32_t c = decodeAt(t, i, &l);
+        if (isCyrLower(c) && !(allowAllCaps && sawUpper && !sawLower)) {
+            sawLower = true; ++letters; i += l; continue;
+        }
+        if (allowAllCaps && !sawLower && isCyrUpper(c)) {
+            sawUpper = true; ++letters; i += l; continue;
+        }
+        if ((c == '-' || c == 0x2010 || c == 0x2011) && letters >= 2) {
+            std::size_t l2 = 0;
+            const char32_t next = decodeAt(t, i + l, &l2);
+            if (isCyrUpper(next)) { i += l + l2; ++letters; continue; }
+        }
+        break;
     }
-
-    std::size_t i = start + 2;
-    while (i + 1 < text.size() && isCyrillicLower(text, i)) {
-        i += 2;
-    }
-
-    outLen = i - start;
-    return outLen >= 4; // At least 2 Cyrillic characters
+    if (letters < 2) return 0;
+    if (!sawLower && !(allowAllCaps && sawUpper)) return 0;
+    if (isLetter(decodeAt(t, i, nullptr))) return 0;
+    return i - pos;
 }
 
 bool isStopWord(const std::string& word) {
     static const std::unordered_set<std::string> stopWords = {
-        "От", "На", "По", "За", "При", "До", "След", "Във", "В", "Със", "С", "Из", 
+        "От", "На", "По", "За", "При", "До", "След", "Във", "В", "Със", "С", "Из",
         "Без", "Към", "И", "Или", "През", "Около", "Под", "Над", "Като",
 
-        "Епикриза", "Придружаващи", "Окончателна", "Анамнеза", "Изследвания", 
-        "Терапия", "Обсъждане", "Препоръки", "Пациент", "Пациентката", "Диагноза", 
-        "Соматичен", "Неврологичен", "Психичен", "Консултативни", "Ход", "Изход", 
-        "Контролни", "Описание", "Лекуващ", "Началник", "Обективно", "Статус", 
+        "Епикриза", "Придружаващи", "Окончателна", "Анамнеза", "Изследвания",
+        "Терапия", "Обсъждане", "Препоръки", "Пациент", "Пациентката", "Диагноза",
+        "Соматичен", "Неврологичен", "Психичен", "Консултативни", "Ход", "Изход",
+        "Контролни", "Описание", "Лекуващ", "Началник", "Обективно", "Статус",
         "Водеща", "Основна", "Възраст", "Пол", "Адрес", "Отделение", "Клиника",
 
-        "КТ", "ЕМГ", "МРТ", "ЕКГ", "АКР", "ЛЗ", "ЛКК", "УИН", "ЕГН", "ЛНЧ", "ИЗ", 
-        "ЗЧЯ", "ВКФ", "КН", "ССС", "ДС", "МПР", "ПИ", "ТРФ", "НПП", "КСП", "СНР", 
+        "КТ", "ЕМГ", "МРТ", "ЕКГ", "АКР", "ЛЗ", "ЛКК", "УИН", "ЕГН", "ЛНЧ", "ИЗ",
+        "ЗЧЯ", "ВКФ", "КН", "ССС", "ДС", "МПР", "ПИ", "ТРФ", "НПП", "КСП", "СНР",
         "КП", "ДЗ", "МКБ", "ПКК", "СУЕ", "АЛАТ", "АСАТ", "ГГТ", "Кр", "Урина",
 
         "No", "№", "бл", "вх", "ап", "ет", "гр", "с", "ул", "бул", "жк", "кв",
-        "Сол", "Струп", "Тест", "Табл", "Амп", "Фл"
+        "Сол", "Струп", "Тест", "Табл", "Амп", "Фл",
+
+        "Консултант", "Консултация", "Консултиран", "Консултирана", "Психолог",
+        "Психиатър", "Невролог", "Лекар", "Доктор", "Пациентът", "Болният", "Болната",
+        "Съпруга", "Съпругата", "Съпруг", "Съпругът", "Дъщеря", "Дъщерята", "Син",
+        "Синът", "Майка", "Майката", "Баща", "Бащата", "Брат", "Братът", "Сестра",
+        "Сестрата", "Внучка", "Внучката", "Внук", "Внукът", "Снаха", "Снахата",
+        "Проведен", "Проведена", "Проведено", "Проведени", "Направен", "Направена",
+        "Назначен", "Назначена", "Изписан", "Изписана", "Приет", "Приета", "Постъпва",
+        "Хоспитализиран", "Хоспитализирана", "Лекуван", "Лекувана", "Насочен", "Насочена"
     };
     return stopWords.find(word) != stopWords.end();
+}
+
+bool isEponym(const std::string& lowerWord) {
+    static const std::unordered_set<std::string> eponyms = {
+        "бабински", "брудзински", "жуковски", "вишневски", "бехтерев", "бехтерева",
+        "корсаков", "корсакова", "павлов", "павлова", "сеченов", "пирогов", "пирогова",
+        "мечников", "кожевников", "кожевникова", "ромберг", "ласег", "хофман", "трьомнер",
+        "маринеско", "кернинг", "кърниг", "опенхайм", "россолимо", "гордон", "шефер",
+        "чадок", "пусеп", "мендел", "вартенберг", "нери", "мингацини", "бинда",
+        "ахилов", "ахилова", "ахилово", "ахилеса"
+    };
+    return eponyms.find(lowerWord) != eponyms.end();
+}
+
+bool endsWith(const std::string& s, const std::string& suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool looksLikeSurname(const std::string& word, bool isLastWord) {
+    const std::string w = lowerUtf8(word);
+    std::size_t start = 0;
+    while (true) {
+        std::size_t dash = w.find('-', start);
+        const std::string part = w.substr(start, dash == npos ? npos : dash - start);
+        if (!isEponym(part)) {
+            for (const char* s : {"ов", "ев", "ова", "ева", "ович", "евич", "ич"}) {
+                if (endsWith(part, s) && part.size() > std::string(s).size() + 2) return true;
+            }
+            if (isLastWord) {
+                for (const char* s : {"ски", "ска", "цки", "цка"}) {
+                    if (endsWith(part, s) && part.size() > std::string(s).size() + 2) return true;
+                }
+            }
+        }
+        if (dash == npos) break;
+        start = dash + 1;
+    }
+    return false;
+}
+
+struct HeaderSpans {
+    std::size_t nameStart = npos, nameEnd = npos;
+    std::size_t townStart = npos, townEnd = npos;
+    std::size_t streetStart = npos, streetEnd = npos;
+};
+
+bool looksLikeIdSegment(const std::string& lowered, std::size_t s, std::size_t e) {
+    const std::string seg = lowered.substr(s, e - s);
+    if (startsWith(seg, 0, "[id_") || startsWith(seg, 0, "№") || startsWith(seg, 0, "no")) return true;
+    for (const char* p : {"из", "и.з", "и. з"}) {
+        if (startsWith(seg, 0, p)) {
+            const std::size_t after = std::string(p).size();
+            if (after >= seg.size() || !isLetter(decodeAt(seg, after, nullptr))) return true;
+        }
+    }
+    static const std::regex yearRef(R"(\d+[ \t]*/[ \t]*(?:19|20)\d{2})");
+    return std::regex_search(seg, yearRef);
+}
+
+bool hasStreetMarker(const std::string& lowered, std::size_t s, std::size_t e) {
+    const std::string seg = lowered.substr(s, e - s);
+    for (const char* m : {"ул.", "бул.", "ж.к", "жк", "кв.", "бл.", "вх.", "ап.", "no", "№"}) {
+        if (seg.find(m) != npos) return true;
+    }
+    return false;
+}
+
+std::vector<HeaderSpans> findHeaders(const std::string& text, const std::string& lowered) {
+    static const std::regex ageFrom(
+        R"(,[ \t]*\d{1,3}[ \t]*(?:год(?:ини|\.)?|г\.)[ \t]*от[ \t]+)");
+    std::vector<HeaderSpans> out;
+    for (std::sregex_iterator it(lowered.begin(), lowered.end(), ageFrom), end; it != end; ++it) {
+        HeaderSpans h;
+        const auto comma = static_cast<std::size_t>(it->position());
+        const std::size_t addrStart = comma + static_cast<std::size_t>(it->length());
+        std::size_t lineStart = (comma == 0) ? npos : lowered.rfind('\n', comma - 1);
+        lineStart = (lineStart == npos) ? 0 : lineStart + 1;
+
+        std::size_t na = npos;
+        std::size_t from = comma;
+        while (from > lineStart) {
+            const std::size_t p = lowered.rfind("на ", from - 1);
+            if (p == npos || p < lineStart) break;
+            if (!isWordBefore(text, p)) { na = p; break; }
+            from = p;
+        }
+        if (na != npos) {
+            const std::size_t s = skipSpaces(text, na + std::string("на ").size());
+            const std::size_t e = skipSpacesBack(text, comma);
+            if (e > s && e - s <= 300) { h.nameStart = s; h.nameEnd = e; }
+        }
+
+        std::size_t lineEnd = lowered.find('\n', addrStart);
+        if (lineEnd == npos) lineEnd = lowered.size();
+        lineEnd = std::min(lineEnd, addrStart + 600);
+        std::size_t kp = lowered.find("по кп", addrStart);
+        if (kp != npos && kp >= lineEnd) kp = npos;
+        const std::size_t regionEnd = (kp != npos) ? kp : lineEnd;
+
+        std::vector<std::pair<std::size_t, std::size_t>> segs;
+        std::size_t segStart = addrStart;
+        for (std::size_t k = addrStart; k <= regionEnd; ++k) {
+            if (k == regionEnd || text[k] == ',') {
+                const std::size_t s = skipSpaces(text, segStart);
+                const std::size_t e = skipSpacesBack(text, k);
+                if (e > s) segs.emplace_back(s, e);
+                segStart = k + 1;
+            }
+        }
+        if (!segs.empty() && !looksLikeIdSegment(lowered, segs[0].first, segs[0].second)) {
+            std::size_t idIdx = npos;
+            for (std::size_t i = 1; i < segs.size(); ++i) {
+                if (looksLikeIdSegment(lowered, segs[i].first, segs[i].second)) { idIdx = i; break; }
+            }
+            std::size_t lastAddr = 0;
+            if (idIdx != npos) {
+                lastAddr = idIdx - 1;
+            } else if (kp != npos) {
+                lastAddr = segs.size() - 1;
+            } else if (segs.size() > 1 && hasStreetMarker(lowered, segs[1].first, segs[1].second)) {
+                lastAddr = 1;
+            }
+            if (segs[0].second - segs[0].first <= 150) {
+                h.townStart = segs[0].first;
+                h.townEnd = segs[0].second;
+            }
+            if (lastAddr >= 1 && segs[lastAddr].second - segs[1].first <= 400) {
+                h.streetStart = segs[1].first;
+                h.streetEnd = segs[lastAddr].second;
+            }
+        }
+        out.push_back(h);
+    }
+    return out;
+}
+
+bool chainedBefore(const std::string& t, std::size_t pos) {
+    if (pos == 0) return false;
+    const char prev = t[pos - 1];
+    if (isAsciiDigit(prev)) return true;
+    return (prev == '.' || prev == '/' || prev == '-' || prev == ',') &&
+           pos >= 2 && isAsciiDigit(t[pos - 2]);
+}
+
+bool chainedAfter(const std::string& t, std::size_t end) {
+    if (end >= t.size()) return false;
+    if (isAsciiDigit(t[end])) return true;
+    return (t[end] == '.' || t[end] == '/' || t[end] == '-' || t[end] == ',') &&
+           end + 1 < t.size() && isAsciiDigit(t[end + 1]);
+}
+
+bool numericNeighbour(const std::string& t, std::size_t pos, std::size_t end) {
+    if (pos > 0 && isAsciiDigit(t[pos - 1])) return true;
+    if (pos >= 2 && (t[pos - 1] == '.' || t[pos - 1] == ',') && isAsciiDigit(t[pos - 2])) return true;
+    if (end < t.size() && isAsciiDigit(t[end])) return true;
+    return end + 1 < t.size() && (t[end] == '.' || t[end] == ',') && isAsciiDigit(t[end + 1]);
+}
+
+bool followedByUnit(const std::string& lowered, std::size_t end) {
+    const std::size_t p = skipSpaces(lowered, end);
+    static const std::vector<std::string> units = {
+        "мкг", "mcg", "мг", "mg", "мм", "mm", "см", "cm", "мл", "ml", "mmol", "ммол",
+        "кг", "kg", "мин", "iu", "ед", "%", "ч", "h", "х", "x"
+    };
+    for (const auto& u : units) {
+        if (startsWith(lowered, p, u)) {
+            const std::size_t after = p + u.size();
+            if (u == "%" || !isLetter(decodeAt(lowered, after, nullptr))) return true;
+        }
+    }
+    return false;
+}
+
+int toInt(const std::string& s) { return s.empty() ? -1 : std::stoi(s); }
+bool inRange(int v, int lo, int hi) { return v >= lo && v <= hi; }
+
+bool acceptDate(const std::string& lowered, const std::smatch& m, std::size_t base,
+                std::size_t& pos, std::size_t& len) {
+    const std::size_t end = pos + len;
+    auto g = [&](int i) { return m[i].matched ? m[i].str() : std::string(); };
+    auto letterBefore = [&](std::size_t p) { return isLetter(prevCodepoint(lowered, p)); };
+
+    if (m[1].matched) {
+        const int d = toInt(g(1)), mo = toInt(g(3));
+        const std::string y = g(4);
+        const bool dayMonth = inRange(d, 1, 31) && inRange(mo, 1, 12);
+        const bool monthDay = inRange(d, 1, 12) && inRange(mo, 1, 31);
+        if (y.size() == 4) {
+            if (!inRange(toInt(y), 1900, 2099) || !(dayMonth || monthDay)) return false;
+            return !numericNeighbour(lowered, pos, end);
+        }
+        if (!dayMonth || g(2) == "-") return false;
+        if (y.size() == 3 && !startsWith(y, 0, "19") && !startsWith(y, 0, "20")) return false;
+        return !chainedBefore(lowered, pos) && !chainedAfter(lowered, end) &&
+               !followedByUnit(lowered, end);
+    }
+    if (m[5].matched) {
+        return inRange(toInt(g(6)), 1, 12) && inRange(toInt(g(7)), 1, 31) &&
+               !chainedBefore(lowered, pos);
+    }
+    if (m[8].matched) {
+        const std::string y = g(9);
+        if (!inRange(toInt(g(8)), 1, 12)) return false;
+        if (y.size() >= 4 && !inRange(toInt(y.substr(0, 4)), 1900, 2099)) return false;
+        return !letterBefore(pos);
+    }
+    if (m[10].matched) {
+        return inRange(toInt(g(10)), 1, 12) && inRange(toInt(g(11)), 1900, 2099) &&
+               !chainedBefore(lowered, pos);
+    }
+    if (m[12].matched) {
+        const bool spaced = m.position(13) > m.position(12) + m.length(12) + 1;
+        if (spaced && g(12).size() != 2) return false;
+        return inRange(toInt(g(12)), 1, 12) && inRange(toInt(g(13)), 1900, 2099) &&
+               !numericNeighbour(lowered, pos, end);
+    }
+    if (m[14].matched) {
+        return inRange(toInt(g(14)), 1, 12) && !chainedBefore(lowered, pos);
+    }
+    if (m[17].matched) {
+        if (m[16].matched && !inRange(toInt(g(16)), 1, 31)) return false;
+        return !letterBefore(pos) && !chainedBefore(lowered, pos);
+    }
+    if (m[19].matched) {
+        return inRange(toInt(g(19)), 1, 31) && !letterBefore(pos) && !chainedBefore(lowered, pos);
+    }
+    if (m[21].matched) {
+        if (letterBefore(pos)) return false;
+        if (!inRange(toInt(g(21)), 1, 31) || !inRange(toInt(g(22)), 1, 12)) return false;
+        const auto s = base + static_cast<std::size_t>(m.position(21));
+        const auto e = base + static_cast<std::size_t>(m.position(22) + m.length(22));
+        if (followedByUnit(lowered, e)) return false;
+        pos = s;
+        len = e - s;
+        return true;
+    }
+    if (m[23].matched) {
+        return inRange(toInt(g(23)), 1, 31) && inRange(toInt(g(24)), 1, 12) &&
+               !chainedBefore(lowered, pos);
+    }
+    if (m[25].matched) {
+        return kMaskStandaloneYears && !chainedBefore(lowered, pos);
+    }
+    return false;
+}
+
+bool isPlausibleBgPhone(std::string digits) {
+    if (startsWith(digits, 0, "00359")) digits = digits.substr(5);
+    else if (startsWith(digits, 0, "359")) digits = digits.substr(3);
+    if (digits.empty()) return false;
+    if (digits[0] != '0') digits = "0" + digits;
+    const std::size_t n = digits.size();
+    if (n == 10 && (startsWith(digits, 0, "087") || startsWith(digits, 0, "088") ||
+                    startsWith(digits, 0, "089") || startsWith(digits, 0, "098") ||
+                    startsWith(digits, 0, "099"))) return true;
+    if (n == 9 && startsWith(digits, 0, "02")) return true;
+    if ((n == 9 || n == 10) && digits[1] >= '3' && digits[1] <= '9' &&
+        !startsWith(digits, 0, "087") && !startsWith(digits, 0, "088") &&
+        !startsWith(digits, 0, "089")) return true;
+    return false;
+}
+
+std::size_t validPhoneLength(const std::string& text, std::size_t pos, std::size_t len) {
+    std::size_t best = 0;
+    std::string digits;
+    for (std::size_t i = pos; i < pos + len; ++i) {
+        if (isAsciiDigit(text[i])) {
+            digits += text[i];
+            const bool groupEnd = (i + 1 == pos + len) || !isAsciiDigit(text[i + 1]);
+            if (groupEnd && isPlausibleBgPhone(digits)) best = i + 1 - pos;
+        }
+    }
+    return best;
+}
+
+bool acceptLocation(const std::string& text, std::size_t pos, std::size_t len) {
+    const std::string match = text.substr(pos, len);
+    const bool cityOrVillage = startsWith(match, 0, "гр.") || startsWith(match, 0, "Гр.") ||
+                               startsWith(match, 0, "с.") || startsWith(match, 0, "град") ||
+                               startsWith(match, 0, "село");
+    if (!cityOrVillage) return true;
+
+    const std::size_t before = skipSpacesBack(text, pos);
+    if (before > 0 && (isAsciiDigit(text[before - 1]) || text[before - 1] == '/')) return false;
+
+    const std::size_t after = skipSpaces(text, pos + len);
+    if (after < text.size() && text[after] == ':') return false;
+
+    std::size_t nameStart = startsWith(match, 0, "с.") ? std::string("с.").size() :
+                            startsWith(match, 0, "село") ? std::string("село").size() : 0;
+    if (nameStart > 0) {
+        nameStart = skipSpaces(text, pos + nameStart);
+        const std::size_t wl = nameWordLength(text, nameStart, false);
+        if (wl > 0 && isEponym(lowerUtf8(text.substr(nameStart, wl)))) return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -157,19 +576,41 @@ bool isStopWord(const std::string& word) {
 EntityDetector::EntityDetector() {
     regexes_ = {
         {EntityType::IDNumber, std::regex(
-            R"((?:И\.?З\.?|Из\.?|из\.?|НЗОК|РЗОК|УИН|ЛЗ|ЛКК|РЗИ|Амб\.?[ \t]*(?:лист|№)|Рег\.?[ \t]*(?:№)?)[ \t]*(?:(?:[:.-]|№)[ \t]*)?[A-Za-z]{0,3}[0-9][A-Za-z0-9./-]{0,15})",
+            R"((?:И\.?З\.?|Из(?=[ \t]*№)|НЗОК|РЗОК|УИН|ЛЗ|ЛКК|РЗИ|Амб(?:\.|улаторен)?[ \t]*(?:лист|№)|Рег\.?[ \t]*(?:№)?)[ \t]*(?:(?:[:.-]|№)[ \t]*)?[A-Za-z]{0,3}[0-9][A-Za-z0-9./-]{0,15})",
             std::regex::icase
         )},
         {EntityType::Location, std::regex(
-            R"((?:гр\.|град|с\.|село|ул\.|улица|бул\.|булевард|ж\.?к\.?|кв\.|пл\.|площад)[ \t]+(?:Св\.|(?![ \t]+(?:№|No|бл\.|вх\.|ап\.|ет\.))[^\x80-\xFF\n,;().]|[\xC2-\xDF][\x80-\xBF]|[\xE0-\xEF][\x80-\xBF]{2}|[\xF0-\xF4][\x80-\xBF]{3}){2,80}(?:[ \t]+(?:№|No|бл\.|вх\.|ап\.|ет\.)[ \t]*\d+(?:[A-Za-z]|[\xD0-\xD3][\x80-\xBF])?(?:[ \t]+(?:вх\.|ет\.|ап\.)[ \t]*(?:\d+(?:[A-Za-z]|[\xD0-\xD3][\x80-\xBF])?|[A-Za-z]|[\xD0-\xD3][\x80-\xBF]))*)?)",
-            std::regex::icase
+            R"((?:(?:гр|Гр|с|ул|Ул|бул|Бул|кв|Кв|пл)\.|ж\.?[ \t]?к\.?|Ж\.?[ \t]?(?:к|К)\.?)[ \t]*)"
+            R"((?:)" CYR_UP CYR_LO R"({0,2}\.[ \t]*){0,2})"
+            R"((?:)" CYR_UP CYR_LO R"(+(?:-)" CYR_UP CYR_LO R"(+)?|[A-Z][a-z]+))"
+            R"((?:[ \t]+(?:\xD0\xB8[ \t]+)?(?:)" CYR_UP CYR_LO R"({0,2}\.[ \t]*){0,2}(?:)" CYR_UP CYR_LO R"(+(?:-)" CYR_UP CYR_LO R"(+)?|[A-Z][a-z]+|\d{1,3}(?:[A-Za-z]|)" CYR_UP R"()?(?![0-9]))){0,3})"
+            R"((?:[ \t]*,?[ \t]*(?:No|№|(?:бл|вх|ет|ап)(?:\.|(?=[ \t]*\d)))[ \t]*(?:\d{1,4}(?:[A-Za-z]|)" CYR_UP R"(|)" CYR_LO R"()?(?![0-9])|[A-Za-z]|)" CYR_UP R"(|)" CYR_LO R"(|\?))*)"
+            R"(|(?:град|село|улица|булевард|квартал|площад)[ \t]+)"
+            R"((?:)" CYR_UP CYR_LO R"({0,2}\.[ \t]*){0,2})"
+            R"((?:)" CYR_UP CYR_LO R"(+(?:-)" CYR_UP CYR_LO R"(+)?)(?:[ \t]+)" CYR_UP CYR_LO R"(+){0,2})"
         )},
         {EntityType::Phone, std::regex(
-            R"((?:\+359[\s./-]?|0)(?:\d{1,3}[\s./-]?)?\d{3}[\s./-]?\d{3,4}\b)"
+            R"((?:\+[ \t]?359|00[ \t]?359|\(0|0)[0-9 \t()/-]{6,16}[0-9])"
         )},
         {EntityType::Date, std::regex(
-            R"(м\.[ \t]*(?:0?[1-9]|1[0-2])\.[ \t]*(?:\d{4}|\d{2})(?:[ \t]*г(?:\.|одина)?)?|\b\d{1,2}[\./-]\d{1,2}[\./-][ \t]*\d{2,4}\b|\b(?:0?[1-9]|1[0-2])\.(?:\d{4}(?:[ \t]*г\.)?|\d{2}[ \t]*г\.)|\b(?:0?[1-9]|1[0-2])[ \t]*м\.[ \t]*\d{4}(?:[ \t]*г\.?)?|\b(?:\d{1,2}[\./-])?\d{4}\s*г(?:\.|одина)?\b|\b\d{1,2}\s+(?:януари|февруари|март|април|май|юни|юли|август|септември|октомври|ноември|декември)(?:\s+\d{2,4}(?:\s*г\.?)?)?\b)",
-            std::regex::icase
+            R"((\d{1,2})[ \t]?([./-])[ \t]?(\d{1,2})[ \t]?\2[ \t]?(\d{4}|\d{3}|\d{2})(?![0-9]))"
+            R"(|((?:19|20)\d{2})-(\d{1,2})-(\d{1,2})(?![0-9]))"
+            R"(|(?:мес|м)\.?[ \t]*(\d{1,2})[ \t]*[./][ \t]*(\d{4,5}|\d{2})(?![0-9]))"
+            R"((?:[ \t]*(?:година|год\.?|г\.?)(?!)" CYR_LO R"())?)"
+            R"(|(\d{1,2})[ \t]*(?:мес|м)\.?[ \t]*(\d{4})(?![0-9]))"
+            R"((?:[ \t]*(?:година|год\.?|г\.?)(?!)" CYR_LO R"())?)"
+            R"(|(\d{1,2})\.[ \t]?(\d{4})(?![0-9]))"
+            R"((?:[ \t]*(?:година|год\.?|г\.?)(?!)" CYR_LO R"())?)"
+            R"(|(\d{2})\.(\d{2})[ \t]*(?:година|год\.?|г\.?)(?!)" CYR_LO R"())"
+            R"(|(?:(\d{1,2})[ \t]*)?(?:м\.?[ \t]*)?)"
+            R"((януари|февруари|март|април|май|юни|юли|август|септември|октомври|ноември|декември|ян\.|фев(?:р)?\.|апр\.|авг\.|сеп(?:т)?\.|окт\.|ное(?:м)?\.|дек\.)\.?)"
+            R"([ \t]*,?[ \t]*((?:19|20)\d{2})(?![0-9]))"
+            R"((?:[ \t]*(?:година|год\.?|г\.?)(?!)" CYR_LO R"())?)"
+            R"(|(\d{1,2})(?:[ \t]*-?[ \t]*(?:ви|ри|ти|ми|и))?[ \t]+)"
+            R"((януари|февруари|март|април|май|юни|юли|август|септември|октомври|ноември|декември)(?!)" CYR_LO R"())"
+            R"(|(?:на|от|до|след|преди|na|ot|do)[ \t]*\(?[ \t]*(\d{1,2})\.(\d{2})(?![0-9]|[ \t]?[./][ \t]?[0-9]))"
+            R"(|(\d{1,2})\.(\d{2})(?=[ \t]*(?:и|-|–|до)[ \t]*\d{1,2}\.\d{1,2}\.\d{2,4}))"
+            R"(|((?:19|20)\d{2})[ \t]*(?:година|год\.?|г\.?)(?!)" CYR_LO R"())"
         )},
         {EntityType::Email, std::regex(
             R"(([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}))"
@@ -181,17 +622,36 @@ EntityDetector::EntityDetector() {
 
     dictionaries_ = {
         {EntityType::Location, {
-            "София", "Пловдив", "Варна", "Бургас", "Русе", "Стара Загора", "Плевен", 
-            "Сливен", "Добрич", "Шумен", "Перник", "Хасково", "Ямбол", "Пазарджик", 
-            "Благоевград", "Велико Търново", "Враца", "Габрово", "Асеновград", "Видин", 
-            "Казанлък", "Кърджали", "Кюстендил", "Монтана", "Търговище", "Силистра", 
-            "Ловеч", "Разград", "Смолян", "Ботевград", "Сандански", "Самоков"
+            "София", "Пловдив", "Варна", "Бургас", "Русе", "Стара Загора", "Плевен",
+            "Сливен", "Добрич", "Шумен", "Перник", "Хасково", "Ямбол", "Пазарджик",
+            "Благоевград", "Велико Търново", "Враца", "Габрово", "Асеновград", "Видин",
+            "Казанлък", "Кърджали", "Кюстендил", "Монтана", "Търговище", "Силистра",
+            "Ловеч", "Разград", "Смолян", "Ботевград", "Сандански", "Самоков",
+            "Димитровград", "Горна Оряховица", "Дупница", "Петрич", "Севлиево", "Нова Загора",
+            "Троян", "Айтос", "Поморие", "Несебър", "Созопол", "Карлово", "Велинград",
+            "Панагюрище", "Гоце Делчев", "Разлог", "Банско", "Свищов", "Попово", "Балчик",
+            "Каварна", "Харманли", "Свиленград", "Чирпан", "Раднево", "Първомай", "Раковски",
+            "Своге", "Костинброд", "Елин Пелин", "Ихтиман", "Божурище", "Банкя", "Нови Искър",
+            "Сливница", "Годеч", "Драгоман", "Правец", "Етрополе", "Пирдоп", "Златица",
+            "Радомир", "Брезник", "Козлодуй", "Мездра", "Берковица", "Червен бряг",
+            "Бяла Слатина", "Луковит", "Тетевен", "Никопол", "Левски", "Белене", "Павликени",
+            "Елена", "Дряново", "Трявна", "Тутракан", "Дулово", "Исперих", "Кубрат",
+            "Нови пазар", "Велики Преслав", "Провадия", "Девня", "Девин", "Златоград",
+            "Мадан", "Момчилград", "Крумовград", "Ардино", "Хисаря", "Сопот", "Стамболийски",
+            "Перущица", "Кричим", "Белово", "Костенец", "Долна баня",
+            "Сапарева баня", "Кресна", "Симитли", "Якоруда", "Белица", "Момин проход",
+            "Суходол", "Бояна", "Драгалевци", "Симеоново", "Княжево", "Овча купел", "Люлин",
+            "Младост", "Дружба", "Надежда", "Лозенец", "Изгрев", "Красно село"
         }},
         {EntityType::Organization, {
-            "МБАЛ", "УМБАЛ", "ВМА", "НЗОК", "РЗОК", "РЗИ", "НАП", "НОИ", "МВР",
-            "ДКЦ", "МЦ", "СБАЛ", "СБАЛО", "СБАЛАГ", "КОЦ", "ЦСМП", "ЦРД", "ЛКК",
-            "Министерство на здравеопазването", "Пирогов", "Александровска", "Св. Иван Рилски",
-            "Св. Анна", "Св. Георги", "Св. Марина", "Токуда", "Софиямед", "Пълмед"
+            "Министерство на здравеопазването", "НЗОК", "РЗОК", "РЗИ", "НОИ", "МВР",
+            "Пирогов", "Александровска", "Александровкса", "Токуда", "Софиямед",
+            "Аджибадем", "Сити Клиник", "УниХоспитал", "Пълмед", "Царица Йоанна",
+            "Царица Йоана", "Св. Иван Рилски", "Св.Иван Рилски", "Свети Иван Рилски",
+            "Иван Рилски", "Св. Анна", "Св.Анна", "Света Анна", "Св. Георги", "Св.Георги",
+            "Св. Марина", "Св.Марина", "Св. Екатерина", "Св.Екатерина", "Света Екатерина",
+            "Св. Наум", "Св.Наум", "Свети Наум", "Св. Мина", "Св. Иван", "Св.Иван",
+            "Курило", "Карлуково"
         }}
     };
 }
@@ -205,67 +665,127 @@ std::vector<DetectedEntity> EntityDetector::detectAll(const std::string& text) c
     detectLNCh(text, rawResults);
     detectUIN(text, rawResults);
 
-    return rawResults;
+    std::sort(rawResults.begin(), rawResults.end(),
+              [](const DetectedEntity& a, const DetectedEntity& b) {
+                  if (a.start != b.start) return a.start < b.start;
+                  return a.length > b.length;
+              });
+    std::vector<DetectedEntity> merged;
+    for (const auto& e : rawResults) {
+        if (e.length == 0) continue;
+        if (!merged.empty() && e.start < merged.back().start + merged.back().length) {
+            auto& last = merged.back();
+            const std::size_t end = std::max(last.start + last.length, e.start + e.length);
+            if (e.score > last.score) {
+                last.type = e.type;
+                last.score = e.score;
+            }
+            last.length = end - last.start;
+            last.text = text.substr(last.start, last.length);
+        } else {
+            merged.push_back(e);
+        }
+    }
+    return merged;
 }
 
 void EntityDetector::detectRegex(const std::string& text, std::vector<DetectedEntity>& results) const {
+    const std::string lowered = lowerUtf8(text);
+
+    auto atBoundary = [&](std::size_t offset) {
+        return offset == text.size() ||
+            (static_cast<unsigned char>(text[offset]) & 0xC0) != 0x80;
+    };
+    auto push = [&](EntityType type, std::size_t pos, std::size_t len, double conf) {
+        if (len == 0) return;
+        if (!atBoundary(pos) || !atBoundary(pos + len)) {
+            throw std::runtime_error(
+                "Detector regex split a UTF-8 character; type=" +
+                std::to_string(static_cast<int>(type)) +
+                " byte_start=" + std::to_string(pos) +
+                " byte_length=" + std::to_string(len));
+        }
+        results.push_back({type, pos, len, text.substr(pos, len), conf});
+    };
+
     for (const auto& [type, pattern] : regexes_) {
-        for (std::sregex_iterator it(text.begin(), text.end(), pattern), end; it != end; ++it) {
-            std::size_t len = static_cast<std::size_t>(it->length());
-            if (len <= (type == EntityType::Location ? 512u : 80u)) {
-                const auto pos = static_cast<std::size_t>(it->position());
-                if (type == EntityType::Location) {
-                    const std::string match = it->str();
-                    const bool isCity = match.rfind("гр.", 0) == 0;
-                    const bool isVillage = match.rfind("с.", 0) == 0;
-                    if (isCity || isVillage) {
-                        std::size_t nameStart = pos + (isCity ? std::string("гр.").size()
-                                                              : std::string("с.").size());
-                        while (nameStart < text.size() &&
-                               (text[nameStart] == ' ' || text[nameStart] == '\t')) ++nameStart;
-                        if (!isCyrillicUpper(text, nameStart)) continue;
-                    }
+        const std::string& subject = (type == EntityType::Date) ? lowered : text;
+        std::size_t from = 0;
+        std::smatch m;
+        while (from < subject.size()) {
+            const auto flags = from > 0 ? std::regex_constants::match_prev_avail
+                                        : std::regex_constants::match_default;
+            if (!std::regex_search(subject.cbegin() + static_cast<std::ptrdiff_t>(from),
+                                   subject.cend(), m, pattern, flags)) {
+                break;
+            }
+            const std::size_t matchPos = from + static_cast<std::size_t>(m.position(0));
+            const std::size_t matchLen = static_cast<std::size_t>(m.length(0));
+            std::size_t pos = matchPos;
+            std::size_t len = matchLen;
+
+            bool ok = len > 0;
+            if (ok && type == EntityType::Date) ok = acceptDate(lowered, m, from, pos, len);
+            if (ok && type == EntityType::Location) ok = acceptLocation(text, pos, len);
+            if (ok && type == EntityType::Phone) {
+                if (pos > 0 && (isAsciiDigit(text[pos - 1]) || text[pos - 1] == '.' ||
+                                text[pos - 1] == ',')) {
+                    ok = false;
+                } else {
+                    len = validPhoneLength(text, pos, len);
+                    ok = len > 0 && !chainedAfter(text, pos + len);
                 }
-                if (type == EntityType::Date) {
-                    const auto end = pos + len;
-                    if ((pos > 0 && (text[pos - 1] == '/' || text[pos - 1] == '.')) ||
-                        text.compare(end, 4, "мг") == 0 ||
-                        text.compare(end, 2, "mg") == 0) {
-                        continue;
-                    }
-                    if (it->str().find('-') != std::string::npos &&
-                        ((end < text.size() && text[end] == '-') ||
-                         (pos > 0 && text[pos - 1] == '-') ||
-                         (end < text.size() && text.compare(end, 2, "ч") == 0))) {
-                        continue;
-                    }
-                }
-                auto atBoundary = [&](std::size_t offset) {
-                    return offset == text.size() ||
-                        (static_cast<unsigned char>(text[offset]) & 0xC0) != 0x80;
-                };
-                if ((type == EntityType::Location ||
-                     type == EntityType::IDNumber ||
-                     type == EntityType::Phone) &&
-                    isWordBefore(text, pos)) {
-                    continue;
-                }
-                if (!atBoundary(pos) || !atBoundary(pos + len)) {
-                    throw std::runtime_error(
-                        "Detector regex split a UTF-8 character; type=" +
-                        std::to_string(static_cast<int>(type)) +
-                        " byte_start=" + std::to_string(pos) +
-                        " byte_length=" + std::to_string(len));
-                }
-                results.push_back({
-                    type,
-                    static_cast<std::size_t>(it->position()),
-                    len,
-                    it->str(),
-                    0.95
-                });
+            }
+            if (ok && (type == EntityType::Location ||
+                       type == EntityType::IDNumber ||
+                       type == EntityType::Phone) &&
+                isWordBefore(text, pos)) {
+                ok = false;
+            }
+            if (ok && len > (type == EntityType::Location ? 512u : 80u)) ok = false;
+
+            if (ok) {
+                push(type, pos, len, 0.95);
+                from = matchPos + matchLen;
+            } else {
+                from = matchPos + getUtf8SequenceLength(static_cast<unsigned char>(subject[matchPos]));
             }
         }
+    }
+
+    static const std::regex hospital(
+        R"(((?:УМБАЛ|МБАЛ|УСБАЛ|СБАЛ|ДПБ|ЦПЗ)(?:\xD0[\x90-\xAF]){0,4}|ДКЦ|МДЦ|МЦ|ЦСМП|КОЦ|ВМА|ИСУЛ|НКБ|ОДПЗС))"
+        R"((?!)" CYR_UP R"(|)" CYR_LO R"(|[A-Za-z]))"
+        R"((?:[ \t]*(?:-|–)?[ \t]*(?:"[^"\n]{1,60}"|„[^"\n]{1,60}?(?:“|”|")|“[^"\n]{1,60}?”|)"
+        R"((?:)" CYR_UP CYR_LO R"({0,2}\.[ \t]*){0,2})" CYR_UP CYR_LO R"(+)"
+        R"((?:[ \t]+(?:)" CYR_UP CYR_LO R"({0,2}\.[ \t]*){0,2})" CYR_UP CYR_LO R"(+){0,2}))?)"
+    );
+    for (std::size_t from = 0; from < text.size();) {
+        std::smatch hm;
+        const auto flags = from > 0 ? std::regex_constants::match_prev_avail
+                                    : std::regex_constants::match_default;
+        if (!std::regex_search(text.cbegin() + static_cast<std::ptrdiff_t>(from), text.cend(),
+                               hm, hospital, flags)) {
+            break;
+        }
+        const std::size_t pos = from + static_cast<std::size_t>(hm.position(0));
+        if (isWordBefore(text, pos)) {
+            from = pos + getUtf8SequenceLength(static_cast<unsigned char>(text[pos]));
+            continue;
+        }
+        auto len = static_cast<std::size_t>(hm.length(0));
+        from = pos + std::max<std::size_t>(len, 1);
+        const std::size_t acronymEnd = pos + static_cast<std::size_t>(hm.length(1));
+        std::size_t nameStart = acronymEnd;
+        while (nameStart < pos + len &&
+               (text[nameStart] == ' ' || text[nameStart] == '\t' || text[nameStart] == '-' ||
+                text[nameStart] == '"' || static_cast<unsigned char>(text[nameStart]) >= 0x80) &&
+               nameWordLength(text, nameStart, false) == 0) {
+            nameStart += getUtf8SequenceLength(static_cast<unsigned char>(text[nameStart]));
+        }
+        const std::size_t wl = nameWordLength(text, nameStart, false);
+        if (wl > 0 && isStopWord(text.substr(nameStart, wl))) len = acronymEnd - pos;
+        push(EntityType::Organization, pos, len, 0.93);
     }
 
     static const std::regex sickLeaveNumber(
@@ -283,105 +803,10 @@ void EntityDetector::detectRegex(const std::string& text, std::vector<DetectedEn
         }
     }
 
-    std::size_t at = 0;
-    while ((at = text.find("год. От", at)) != std::string::npos) {
-        std::size_t cityStart = at + std::string("год. От").size();
-        while (cityStart < text.size() &&
-               (text[cityStart] == ' ' || text[cityStart] == '\t'))
-            ++cityStart;
-
-        std::size_t cursor = cityStart;
-        std::size_t cityEnd = cityStart;
-        for (int word = 0; word < 3; ++word) {
-            std::size_t length = 0;
-            if (!isCapitalizedWord(text, cursor, length)) break;
-            cityEnd = cursor + length;
-            cursor = cityEnd;
-            while (cursor < text.size() &&
-                   (text[cursor] == ' ' || text[cursor] == '\t'))
-                ++cursor;
-            if (cursor < text.size() && text[cursor] == ',') {
-                if (cityEnd - cityStart <= 90)
-                    results.push_back({EntityType::Location, cityStart,
-                                       cityEnd - cityStart,
-                                       text.substr(cityStart, cityEnd - cityStart),
-                                       0.97});
-                break;
-            }
-            if (cursor == cityEnd) break; 
-        }
-
-        std::size_t headerEnd = text.find('\n', cityStart);
-        if (headerEnd == std::string::npos || headerEnd > cityStart + 240)
-            headerEnd = std::min(text.size(), cityStart + 240);
-        const auto admission = text.find("по КП", cityStart);
-        if (admission != std::string::npos && admission < headerEnd)
-            headerEnd = admission;
-
-        std::size_t no = cityStart;
-        while ((no = text.find("No", no)) != std::string::npos && no < headerEnd) {
-            std::size_t endNo = no + 2;
-            if (isWordBefore(text, no) ||
-                (endNo < headerEnd && text[endNo] != ' ' && text[endNo] != '\t')) {
-                no += 2;
-                continue;
-            }
-            while (endNo < headerEnd && (text[endNo] == ' ' || text[endNo] == '\t'))
-                ++endNo;
-            const auto digits = endNo;
-            while (endNo < headerEnd &&
-                   endNo - digits < 4 && text[endNo] >= '0' && text[endNo] <= '9')
-                ++endNo;
-            if (endNo > digits) {
-                if (endNo < headerEnd &&
-                    static_cast<unsigned char>(text[endNo]) >= 0xD0 &&
-                    static_cast<unsigned char>(text[endNo]) <= 0xD3 &&
-                    endNo + 1 < headerEnd &&
-                    (static_cast<unsigned char>(text[endNo + 1]) & 0xC0) == 0x80)
-                    endNo += 2;
-                else if (endNo < headerEnd &&
-                         ((text[endNo] >= 'A' && text[endNo] <= 'Z') ||
-                          (text[endNo] >= 'a' && text[endNo] <= 'z')))
-                    ++endNo;
-                static const std::regex addressTail(
-                    R"((?:[ \t]+(?:вх\.?|ет\.?|ап\.?)[ \t]*(?:\d{1,4}(?:[A-Za-z]|[\xD0-\xD3][\x80-\xBF])?|[A-Za-z]|[\xD0-\xD3][\x80-\xBF]))+)"
-                );
-                std::smatch tail;
-                if (std::regex_search(text.cbegin() + endNo,
-                                      text.cbegin() + headerEnd, tail, addressTail,
-                                      std::regex_constants::match_continuous)) {
-                    endNo += tail.length();
-                }
-                if (!isWordAfter(text, endNo)) {
-                    std::size_t streetEnd = no;
-                    while (streetEnd > cityStart &&
-                           (text[streetEnd - 1] == ' ' ||
-                            text[streetEnd - 1] == '\t'))
-                        --streetEnd;
-                    std::size_t streetStart = streetEnd;
-                    while (streetStart > cityStart &&
-                           text[streetStart - 1] != ' ' &&
-                           text[streetStart - 1] != '\t' &&
-                           text[streetStart - 1] != ',' &&
-                           text[streetStart - 1] != '.')
-                        --streetStart;
-                    std::size_t streetLen = 0;
-                    if (isCapitalizedWord(text, streetStart, streetLen) &&
-                        streetStart + streetLen == streetEnd) {
-                        results.push_back({EntityType::Location, streetStart,
-                                           streetLen,
-                                           text.substr(streetStart, streetLen),
-                                           0.96});
-                    }
-                    results.push_back({EntityType::Location, no, endNo - no,
-                                       text.substr(no, endNo - no), 0.97});
-                }
-            }
-            no += 2;
-        }
-        at = cityStart;
+    for (const auto& h : findHeaders(text, lowered)) {
+        if (h.townStart != npos) push(EntityType::Location, h.townStart, h.townEnd - h.townStart, 0.995);
+        if (h.streetStart != npos) push(EntityType::Location, h.streetStart, h.streetEnd - h.streetStart, 0.995);
     }
-
 }
 
 void EntityDetector::detectLNCh(const std::string& text, std::vector<DetectedEntity>& results) const {
@@ -394,15 +819,16 @@ void EntityDetector::detectLNCh(const std::string& text, std::vector<DetectedEnt
                 static_cast<std::size_t>(it->position()),
                 static_cast<std::size_t>(it->length()),
                 candidate,
-                0.95 
+                0.95
             });
         }
     }
 }
 
 void EntityDetector::detectUIN(const std::string& text, std::vector<DetectedEntity>& results) const {
-    static const std::regex uinRegex(R"(\bУИН\s*(?:[:№.]\s*)?(\d{10})\b)", std::regex::icase);
+    static const std::regex uinRegex(R"(УИН[ \t]*(?:(?::|№|\.)[ \t]*)?(\d{10})(?![0-9]))", std::regex::icase);
     for (std::sregex_iterator it(text.begin(), text.end(), uinRegex), end; it != end; ++it) {
+        if (isWordBefore(text, static_cast<std::size_t>(it->position()))) continue;
         std::string candidate = (*it)[1].str();
         if (isValidUIN(candidate)) {
             results.push_back({
@@ -417,21 +843,30 @@ void EntityDetector::detectUIN(const std::string& text, std::vector<DetectedEnti
 }
 
 void EntityDetector::detectDictionaries(const std::string& text, std::vector<DetectedEntity>& results) const {
+    const std::string lowered = lowerUtf8(text);
+    auto scan = [&](EntityType type, const std::string& haystack, const std::string& needle,
+                    const std::string& original) {
+        std::size_t pos = haystack.find(needle);
+        while (pos != npos) {
+            const bool eponymPirogov = lowerUtf8(original) == "пирогов" && pos >= 5 &&
+                                       lowered.compare(pos - 5, 5, "по ") == 0;
+            if (!eponymPirogov &&
+                !isWordBefore(text, pos) &&
+                !isWordAfter(text, pos + needle.length())) {
+                results.push_back({type, pos, needle.length(), text.substr(pos, needle.length()), 0.85});
+            }
+            pos = haystack.find(needle, pos + needle.length());
+        }
+    };
+
     for (const auto& [type, terms] : dictionaries_) {
         for (const auto& term : terms) {
-            std::size_t pos = text.find(term);
-            while (pos != std::string::npos) {
-                if (!isWordBefore(text, pos) &&
-                    !isWordAfter(text, pos + term.length())) {
-                    results.push_back({
-                        type,
-                        pos,
-                        term.length(),
-                        term,
-                        0.85
-                    });
-                }
-                pos = text.find(term, pos + term.length());
+            if (type == EntityType::Location) {
+                scan(type, text, term, term);
+                const std::string upper = upperUtf8(term);
+                if (upper != term) scan(type, text, upper, term);
+            } else {
+                scan(type, lowered, lowerUtf8(term), term);
             }
         }
     }
@@ -451,109 +886,125 @@ void EntityDetector::detectEGN(const std::string& text, std::vector<DetectedEnti
             });
         }
     }
+
+    static const std::regex labelled(R"((?:ЕГН|ЛНЧ|ЕНЧ)[ \t]*(?:(?::|№|-)[ \t]*)?(\d{10})(?![0-9]))");
+    for (std::sregex_iterator it(text.begin(), text.end(), labelled), end; it != end; ++it) {
+        if (isWordBefore(text, static_cast<std::size_t>(it->position()))) continue;
+        results.push_back({
+            EntityType::IDNumber,
+            static_cast<std::size_t>(it->position(1)),
+            static_cast<std::size_t>(it->length(1)),
+            (*it)[1].str(),
+            0.99
+        });
+    }
 }
 
 void EntityDetector::detectNER(const std::string& text, std::vector<DetectedEntity>& results) const {
-    static const std::vector<std::string> prefixes = {
-        "акад. д-р ", "акад.д-р ", "проф. д-р ", "проф.д-р ", 
-        "доц. д-р ", "доц.д-р ", "д-р ", "д-р"
-    };
+    const std::string lowered = lowerUtf8(text);
 
-    for (const auto& prefix : prefixes) {
-        std::size_t pos = 0;
-        while ((pos = text.find(prefix, pos)) != std::string::npos) {
-            std::size_t start = pos;
-            std::size_t i = pos + prefix.length();
+    for (const auto& h : findHeaders(text, lowered)) {
+        if (h.nameStart != npos) {
+            results.push_back({EntityType::Person, h.nameStart, h.nameEnd - h.nameStart,
+                               text.substr(h.nameStart, h.nameEnd - h.nameStart), 0.99});
+        }
+    }
 
-            while (i < text.size() && (text[i] == ' ' || text[i] == '\t')) ++i;
+    static const std::regex titleRe(R"((?:акад|проф|доц|гл\.[ \t]?ас|ас)\.|д(?:-|–|‐)р\.?|dr\.|г-жа|г-н)");
 
-            while (i < text.size()) {
-                unsigned char c = static_cast<unsigned char>(text[i]);
-                if (c == '.' || c == ' ' || c == '-') {
-                    ++i;
-                } else if ((c == 0xD0 || c == 0xD1) && (i + 1 < text.size())) {
-                    i += 2;
-                } else {
-                    break;
-                }
+    for (std::sregex_iterator it(lowered.begin(), lowered.end(), titleRe), end; it != end; ++it) {
+        const auto start = static_cast<std::size_t>(it->position());
+        if (isWordBefore(text, start)) continue;
+        std::size_t cursor = start + static_cast<std::size_t>(it->length());
+
+        while (true) {
+            const std::size_t q = skipSpaces(lowered, cursor);
+            std::smatch more;
+            if (q < lowered.size() &&
+                std::regex_search(lowered.cbegin() + static_cast<std::ptrdiff_t>(q), lowered.cend(),
+                                  more, titleRe, std::regex_constants::match_continuous)) {
+                cursor = q + static_cast<std::size_t>(more.length());
+            } else {
+                break;
             }
+        }
 
-            std::size_t matchLen = i - start;
-            std::string matchStr = text.substr(start, matchLen);
-
-            while (!matchStr.empty() && (matchStr.back() == '/' || matchStr.back() == ' ' || 
-                                         matchStr.back() == '\t' || matchStr.back() == ',')) {
-                matchStr.pop_back();
+        std::size_t i = cursor;
+        std::size_t lastEnd = npos;
+        int words = 0;
+        for (int token = 0; token < 6 && words < 3; ++token) {
+            const std::size_t j = skipSpaces(text, i);
+            std::size_t l = 0;
+            const char32_t c = decodeAt(text, j, &l);
+            if (isUpperLetter(c) && j + l < text.size() && text[j + l] == '.') {
+                i = j + l + 1;
+                lastEnd = i;
+                continue;
             }
-
-            if (matchStr.length() > prefix.length()) {
-                results.push_back({
-                    EntityType::Person,
-                    start,
-                    matchStr.length(),
-                    matchStr,
-                    0.99
-                });
+            const std::size_t wl = nameWordLength(text, j, true);
+            if (wl == 0 || isStopWord(text.substr(j, wl))) break;
+            i = j + wl;
+            lastEnd = i;
+            if (wl <= 4 && i < text.size() && text[i] == '.') {
+                lastEnd = ++i;
+                continue;
             }
-
-            pos += prefix.length();
+            ++words;
+        }
+        if (lastEnd != npos) {
+            results.push_back({EntityType::Person, start, lastEnd - start,
+                               text.substr(start, lastEnd - start), 0.99});
         }
     }
 
     std::size_t i = 0;
     while (i < text.size()) {
-        std::size_t w1Len = 0;
-        if (isCapitalizedWord(text, i, w1Len)) {
-            std::string firstWord = text.substr(i, w1Len);
-            if (isStopWord(firstWord)) {
-                i += w1Len;
-                continue;
+        std::size_t w1 = 0;
+        if (!isWordBefore(text, i) && (w1 = nameWordLength(text, i, false)) > 0) {
+            std::vector<std::pair<std::size_t, std::size_t>> seq;
+            std::size_t p = i;
+            std::size_t wl = w1;
+            while (wl > 0 && seq.size() < 6) {
+                const std::string w = text.substr(p, wl);
+                if (isStopWord(w)) break;
+                seq.emplace_back(p, p + wl);
+                const std::size_t next = skipSpaces(text, p + wl);
+                if (next == p + wl) break;
+                p = next;
+                wl = nameWordLength(text, p, false);
             }
 
-            std::size_t j = i + w1Len;
-            while (j < text.size() && (text[j] == ' ' || text[j] == '\t')) ++j;
-
-            std::size_t w2Len = 0;
-            if (j < text.size() && isCapitalizedWord(text, j, w2Len)) {
-                std::string secondWord = text.substr(j, w2Len);
-                if (isStopWord(secondWord)) {
-                    i = j + w2Len;
-                    continue;
+            if (seq.size() >= 2) {
+                std::size_t last = npos;
+                for (std::size_t k = 0; k < seq.size(); ++k) {
+                    const std::string w = text.substr(seq[k].first, seq[k].second - seq[k].first);
+                    if (looksLikeSurname(w, k + 1 == seq.size())) last = k;
                 }
-
-                std::size_t k = j + w2Len;
-                while (k < text.size() && (text[k] == ' ' || text[k] == '\t')) ++k;
-
-                std::size_t w3Len = 0;
-                bool hasW3 = false;
-                if (k < text.size() && isCapitalizedWord(text, k, w3Len)) {
-                    std::string thirdWord = text.substr(k, w3Len);
-                    if (!isStopWord(thirdWord)) {
-                        hasW3 = true;
+                if (last != npos) {
+                    std::size_t first = (last >= 2) ? last - 2 : 0;
+                    std::size_t lastWord = last;
+                    if (last == 0) lastWord = 1;
+                    const std::size_t s = seq[first].first;
+                    const std::size_t e = seq[lastWord].second;
+                    if (e - s <= 160) {
+                        results.push_back({EntityType::Person, s, e - s, text.substr(s, e - s), 0.88});
                     }
                 }
-
-                std::size_t totalLen = hasW3 ? (k + w3Len - i) : (j + w2Len - i);
-                const std::string patientPrefix = "На ";
-                const bool afterPatientPrefix = i >= patientPrefix.size() &&
-                    text.compare(i - patientPrefix.size(), patientPrefix.size(), patientPrefix) == 0;
-                if (totalLen <= 60 && (hasW3 || afterPatientPrefix)) {
-                    results.push_back({
-                        EntityType::Person,
-                        i,
-                        totalLen,
-                        text.substr(i, totalLen),
-                        0.88
-                    });
-                }
-
-                i += totalLen;
+                i = seq.back().second;
                 continue;
             }
+            if (!seq.empty()) {
+                i = seq.back().second;
+                continue;
+            }
+            i += w1;
+            continue;
         }
-
         i += getUtf8SequenceLength(static_cast<unsigned char>(text[i]));
     }
 }
+
+#undef CYR_UP
+#undef CYR_LO
 
 } // namespace deid

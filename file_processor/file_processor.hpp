@@ -33,6 +33,9 @@ public:
     virtual bool writeText(const fs::path& outputPath, const std::string& content) = 0;
 };
 
+std::string pathToUtf8(const fs::path& path);
+void setupConsole();
+
 std::unique_ptr<IDocumentParser> createParserForExtension(const std::string& extension);
 
 fs::path getInputFolder(int argc, char* argv[]);
